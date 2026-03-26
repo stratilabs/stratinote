@@ -6,17 +6,20 @@
 
 ### Assets to Protect
 1. **User knowledge entries** — private intellectual content, potentially sensitive.
-2. **User credentials** — passwords, session tokens.
-3. **API keys** — Claude/Anthropic and embedding model API keys.
-4. **User profile data** — display name, email.
+2. **User credentials** — passwords, session tokens, refresh tokens.
+3. **Personal API Tokens** — grant full user-scoped access; treated as secrets.
+4. **Service API keys** — Anthropic API key, embedding provider key, Supabase service role key.
+5. **User profile data** — display name, email.
 
 ### Threat Actors
 | Actor | Description |
 |-------|-------------|
 | **Unauthenticated external attacker** | Attempts to access the API without credentials |
 | **Authenticated malicious user** | Attempts to access or corrupt another user's data |
-| **Compromised API key holder** | Has a leaked/stolen API key |
-| **Server-side injection attacker** | Attempts SQL/command injection via input fields |
+| **Compromised PAT holder** | Has a leaked Personal API Token (e.g. from Claude.ai integration settings) |
+| **Leaked service key holder** | Has a leaked Anthropic or Supabase service role key |
+| **Server-side injection attacker** | Attempts SQL/command/YAML injection via input fields |
+| **Brute-force attacker** | Attempts to guess passwords or enumerate valid user emails |
 
 ### Out of Scope
 - Physical infrastructure attacks (mitigated by Supabase managed service).
@@ -29,8 +32,13 @@
 ### SEC-001 — Supabase Auth as Identity Provider
 All user authentication is delegated to Supabase Auth. The system does not implement its own password hashing or session management.
 
-### SEC-002 — JWT Validation
-Every API request must include a valid Supabase JWT in the `Authorization: Bearer` header. The backend validates the JWT signature using the Supabase JWT secret before processing any request.
+### SEC-002 — Dual Authentication Methods
+The API accepts two authentication methods, validated in this order:
+
+1. **Supabase JWT** — issued by Supabase Auth for web UI sessions. Validated by checking the JWT signature against the Supabase JWT secret.
+2. **Personal API Token (PAT)** — a bearer token prefixed `sn_`. Validated by SHA-256 hashing the token and looking up the hash in the `api_tokens` table. The resolved user identity is used for all subsequent RLS checks.
+
+A request missing both returns HTTP 401. PAT creation (`POST /auth/tokens`) requires a Supabase JWT specifically (cannot be done with a PAT).
 
 ### SEC-003 — Session Expiry
 JWTs expire after **1 hour** (Supabase default). Refresh tokens are used to silently re-authenticate. Refresh tokens expire after **24 hours** of inactivity.
@@ -38,11 +46,24 @@ JWTs expire after **1 hour** (Supabase default). Refresh tokens are used to sile
 ### SEC-004 — Secure Token Storage
 - Web UI: JWT stored in memory only; refresh token stored in a `httpOnly`, `Secure`, `SameSite=Strict` cookie.
 - No JWTs stored in `localStorage` or `sessionStorage`.
+- Personal API Tokens: shown once in the web UI immediately after creation. The plaintext is never stored server-side; only the SHA-256 hash is persisted.
+
+### SEC-004a — CSRF Protection
+Cookie-based auth (refresh token) is protected against CSRF as follows:
+- `SameSite=Strict` prevents the cookie from being sent on cross-origin requests in modern browsers.
+- All state-mutating API requests (`POST`, `PATCH`, `DELETE`) additionally require a `X-Requested-With: XMLHttpRequest` header, which browsers cannot set cross-origin without a CORS preflight (which the strict CORS policy will block).
+- The Supabase JWT itself (stored in memory, not cookies) is required for API calls, which cannot be stolen via CSRF.
 
 ### SEC-005 — Password Policy
 Enforced by Supabase Auth:
 - Minimum 8 characters.
 - At least one uppercase, one lowercase, one digit.
+
+### SEC-005a — Brute-Force and Account Lockout
+- Supabase Auth rate-limits sign-in attempts: maximum **5 failed attempts per 15 minutes** per email address; configured in the Supabase Auth settings.
+- After 5 failures, the account is temporarily locked and the user receives an email to unlock.
+- Auth API endpoints (`/auth/v1/token`, `/auth/v1/signup`) are additionally rate-limited at the edge (30 requests/minute per IP).
+- Sign-in responses for invalid credentials return a generic message ("Invalid email or password") — no enumeration of whether the email exists.
 
 ### SEC-006 — OAuth Security
 When OAuth providers (Google, GitHub) are enabled:
@@ -143,19 +164,15 @@ Imported files must:
 ## 5. API Security
 
 ### SEC-015 — CORS Policy
-The API sets a strict CORS policy allowing only the configured frontend origin. `Access-Control-Allow-Origin: <FRONTEND_URL>`. Wildcard `*` is forbidden.
+Supabase Edge Functions set a strict CORS policy allowing only the configured frontend origin. `Access-Control-Allow-Origin: <FRONTEND_URL>`. Wildcard `*` is forbidden. The Supabase project's allowed origins are configured in the Supabase dashboard.
 
 ### SEC-016 — Rate Limiting
-API endpoints are rate-limited per authenticated user:
-- General API: **120 requests/minute**.
-- Search endpoints: **30 requests/minute**.
-- Export endpoint: **5 requests/hour**.
-- Import endpoint: **10 requests/hour**.
+Edge Functions enforce rate limiting per authenticated user (see API Specification §4). PostgREST rate limits are configured at the Supabase project level.
 
 Exceeding limits returns HTTP 429 with a `Retry-After` header.
 
 ### SEC-017 — HTTPS Only
-All traffic between clients and the backend, and between the backend and Supabase, must use TLS 1.2 or higher. HTTP is redirected to HTTPS.
+All Supabase endpoints (PostgREST, Auth, Edge Functions) are HTTPS-only by default. The Next.js frontend must be deployed with HTTPS enforced. HTTP requests are redirected to HTTPS.
 
 ### SEC-018 — Security Headers
 The web application sets the following HTTP headers:
@@ -171,18 +188,47 @@ Permissions-Policy: geolocation=(), microphone=(), camera=()
 
 ## 6. Secrets Management
 
-### SEC-019 — Environment Variables
-All secrets (Supabase URL, service role key, Anthropic API key, JWT secret) are stored as environment variables. They are never committed to source control.
+### SEC-019 — Secrets Storage
+- **Edge Function secrets** (Anthropic API key, embedding provider key, `EMBEDDING_DIMENSIONS`, etc.) are stored as Supabase project secrets, accessible only by Edge Functions at runtime. They are never visible in the dashboard after creation.
+- **Frontend environment variables** (`NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`) are safe to expose publicly; they are scoped by RLS.
+- The Supabase **service role key** is stored only as a Supabase project secret for use by Edge Functions. It is never included in the frontend bundle.
 
 ### SEC-020 — Secret Rotation
-API keys must be rotatable without downtime. The system supports reading the key from environment variables at runtime (no restart required for key rotation on serverless deployments).
+Supabase project secrets can be updated without redeploying Edge Functions (they are read at cold start). Rotating the Anthropic API key or embedding key requires updating the Supabase secret — Edge Functions will pick it up on next invocation.
 
 ### SEC-021 — `.env` Protection
-A `.gitignore` rule ensures `.env`, `.env.local`, `.env.production` are never committed. A pre-commit hook validates this.
+A `.gitignore` rule ensures `.env`, `.env.local`, `.env.production` are never committed. A pre-commit hook validates this. Only `.env.example` (with placeholder values) is committed.
 
 ---
 
-## 7. Data Privacy
+## 7. Audit Logging
+
+### SEC-022a — Audit Log for Sensitive Operations
+The following operations are recorded in an `audit_log` table (service role only; not user-readable via API):
+
+| Event | Logged Data |
+|-------|-------------|
+| PAT created | user_id (hashed), token_prefix, timestamp |
+| PAT revoked | user_id (hashed), token_prefix, timestamp |
+| Entry hard-deleted | user_id (hashed), entry_id, timestamp |
+| Knowledge base exported | user_id (hashed), entry count, timestamp |
+| Knowledge base imported | user_id (hashed), file count, timestamp |
+| Failed PAT authentication | token_prefix (if recognisable), IP (hashed), timestamp |
+
+No entry content or PII is written to the audit log.
+
+---
+
+## 8. Dependency Security
+
+### SEC-022b — Dependency Vulnerability Scanning
+- Dependabot is enabled on the repository to alert on known CVEs in npm dependencies.
+- `npm audit` runs as a required CI step; builds fail on high or critical severity findings.
+- Supabase client and Edge Function dependencies are reviewed on each version bump.
+
+---
+
+## 9. Data Privacy
 
 ### SEC-022 — Data Minimisation
 The system does not collect user data beyond what is functionally required (email, display name, entries).

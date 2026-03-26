@@ -1,226 +1,111 @@
 # API Specification
 
-All API endpoints are prefixed with `/api/v1`. All requests and responses use `application/json` unless otherwise noted.
+There is no custom backend server. The frontend and MCP server communicate with Supabase directly:
 
-Authentication is via Supabase JWT passed as `Authorization: Bearer <token>`. All endpoints require authentication unless marked `[public]`.
+- **CRUD on entries, links, profiles** → Supabase PostgREST (auto-generated from schema, secured by RLS)
+- **Complex operations** → Supabase Edge Functions invoked at `https://<project>.supabase.co/functions/v1/<name>`
 
----
-
-## Conventions
-
-- Timestamps are ISO 8601 UTC strings.
-- UUIDs are standard `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` format.
-- Errors follow the format:
-  ```json
-  {
-    "error": {
-      "code": "ENTRY_NOT_FOUND",
-      "message": "Entry with id '...' not found.",
-      "details": {}
-    }
-  }
-  ```
-- Pagination uses cursor-based pagination: `?cursor=<last_id>&limit=<n>`.
+Authentication for all calls:
+- **Web UI sessions**: Supabase JS client handles JWT automatically (from Supabase Auth session).
+- **MCP server / PAT calls**: `Authorization: Bearer <personal-api-token>` passed to Edge Functions; Edge Functions resolve the user from the PAT, then operate as that user via the Supabase service client scoped to that user's `user_id`.
 
 ---
 
-## Error Codes
+## 1. PostgREST — Entry CRUD
 
-| Code | HTTP Status | Description |
-|------|------------|-------------|
-| `UNAUTHORIZED` | 401 | Missing or invalid auth token |
-| `FORBIDDEN` | 403 | Authenticated but not allowed |
-| `NOT_FOUND` | 404 | Resource does not exist or not visible to user |
-| `VALIDATION_ERROR` | 422 | Request body fails schema validation |
-| `CONFLICT` | 409 | Duplicate resource (e.g. duplicate link) |
-| `INTERNAL_ERROR` | 500 | Unexpected server error |
+Supabase exposes all tables as REST resources at `https://<project>.supabase.co/rest/v1/<table>`.
+RLS policies enforce ownership on every call. No custom routing needed.
 
----
+### List entries
+```
+GET /rest/v1/entries?select=id,type,title,tags,status,project_id,created_at,updated_at
+  &deleted_at=is.null
+  &order=updated_at.desc
+  &limit=20
+  &offset=0
+```
+Add filters: `&type=eq.note`, `&tags=cs.{ai,notes}`, `&project_id=eq.<uuid>`
 
-## 1. Entries
+### Get single entry (with related data)
+```
+GET /rest/v1/entries?id=eq.<uuid>
+  &select=*,entry_links!source_entry_id(target_entry_id)
+```
 
-### `GET /entries`
-List entries for the authenticated user.
+### Create entry
+```
+POST /rest/v1/entries
+Content-Type: application/json
+Prefer: return=representation
 
-**Query Parameters:**
-| Param | Type | Default | Description |
-|-------|------|---------|-------------|
-| `type` | `entry_type` | - | Filter by entry type |
-| `status` | `entry_status` | `active,draft` | Filter by status |
-| `tags` | `string` (comma-separated) | - | Filter entries containing ALL given tags |
-| `project_id` | `uuid` | - | Filter by project |
-| `sort` | `created_at\|updated_at\|title` | `updated_at` | Sort field |
-| `order` | `asc\|desc` | `desc` | Sort order |
-| `cursor` | `string` | - | Pagination cursor |
-| `limit` | `int` | `20` | Max 100 |
+{ "type": "note", "title": "...", "body": "...", "tags": [], "status": "draft", "metadata": {} }
+```
 
-**Response 200:**
-```json
-{
-  "data": [
-    {
-      "id": "uuid",
-      "type": "note",
-      "title": "string",
-      "tags": ["string"],
-      "status": "active",
-      "project_id": null,
-      "created_at": "ISO8601",
-      "updated_at": "ISO8601"
-    }
-  ],
-  "next_cursor": "uuid | null"
-}
+### Update entry
+```
+PATCH /rest/v1/entries?id=eq.<uuid>
+Content-Type: application/json
+Prefer: return=representation
+
+{ "title": "...", "body": "...", "updated_at": "now()" }
+```
+> `type` is immutable; include it in the `PATCH` body and the DB will reject a change via a trigger.
+
+### Soft-delete entry
+```
+PATCH /rest/v1/entries?id=eq.<uuid>
+{ "status": "deleted", "deleted_at": "<ISO8601>" }
+```
+
+### Hard-delete entry
+Hard delete requires the `hard-delete` Edge Function (see §2) to cascade cleanly and log the action.
+
+### Backlinks
+```
+GET /rest/v1/entry_links?target_entry_id=eq.<uuid>
+  &select=source_entry_id,entries!source_entry_id(id,title,type)
+```
+
+### Create entry link
+```
+POST /rest/v1/entry_links
+{ "source_entry_id": "<uuid>", "target_entry_id": "<uuid>" }
+```
+
+### Delete entry link
+```
+DELETE /rest/v1/entry_links?source_entry_id=eq.<uuid>&target_entry_id=eq.<uuid>
+```
+
+### List templates (stored in a `templates` table, read-only)
+```
+GET /rest/v1/templates?select=type,template_markdown
+GET /rest/v1/templates?type=eq.note&select=type,template_markdown
+```
+
+### User profile
+```
+GET  /rest/v1/profiles?id=eq.<user_id>&select=*
+PATCH /rest/v1/profiles?id=eq.<user_id>
+{ "display_name": "...", "avatar_url": "..." }
 ```
 
 ---
 
-### `POST /entries`
-Create a new entry.
+## 2. Edge Functions
 
-**Request Body:**
-```json
-{
-  "type": "note",
-  "title": "string",
-  "body": "string (markdown)",
-  "tags": ["string"],
-  "status": "draft",
-  "project_id": "uuid | null",
-  "metadata": {}
-}
-```
+Edge Functions are deployed to Supabase and invoked over HTTPS. They use the Supabase service client internally but scope all queries to the authenticated user's `user_id`.
 
-**Response 201:**
-```json
-{
-  "data": {
-    "id": "uuid",
-    "type": "note",
-    "title": "string",
-    "body": "string",
-    "tags": ["string"],
-    "status": "draft",
-    "project_id": null,
-    "metadata": {},
-    "created_at": "ISO8601",
-    "updated_at": "ISO8601"
-  }
-}
-```
+All Edge Functions accept `Authorization: Bearer <jwt-or-pat>` and return `application/json`.
 
-**Errors:** `VALIDATION_ERROR` if schema fails; `NOT_FOUND` if `project_id` does not exist.
+**Base URL:** `https://<project>.supabase.co/functions/v1/`
 
 ---
 
-### `GET /entries/:id`
-Get a single entry by ID.
+### `POST /functions/v1/search`
+Full-text and semantic search.
 
-**Response 200:** Full entry object (same as POST response).
-**Errors:** `NOT_FOUND`.
-
----
-
-### `PATCH /entries/:id`
-Partially update an entry.
-
-**Request Body:** Any subset of `title`, `body`, `tags`, `status`, `metadata`. `type` is immutable.
-
-**Response 200:** Updated full entry object.
-**Errors:** `NOT_FOUND`, `VALIDATION_ERROR`.
-
----
-
-### `DELETE /entries/:id`
-Soft-delete an entry (sets `status = 'deleted'`, `deleted_at = now()`).
-
-**Response 204:** No content.
-**Errors:** `NOT_FOUND`.
-
----
-
-### `DELETE /entries/:id?hard=true`
-Permanently delete an entry and all associated links and embeddings.
-
-**Response 204:** No content.
-**Errors:** `NOT_FOUND`.
-
----
-
-### `GET /entries/:id/backlinks`
-List entries that link to this entry.
-
-**Response 200:**
-```json
-{
-  "data": [
-    { "id": "uuid", "title": "string", "type": "note" }
-  ]
-}
-```
-
----
-
-## 2. Entry Links
-
-### `POST /entries/:id/links`
-Create an explicit link from this entry to another.
-
-**Request Body:**
-```json
-{ "target_entry_id": "uuid" }
-```
-
-**Response 201:**
-```json
-{ "source_entry_id": "uuid", "target_entry_id": "uuid" }
-```
-
-**Errors:** `NOT_FOUND`, `CONFLICT` (duplicate link), `VALIDATION_ERROR` (self-link).
-
----
-
-### `DELETE /entries/:id/links/:target_id`
-Remove a link between two entries.
-
-**Response 204:** No content.
-
----
-
-## 3. Templates
-
-### `GET /templates`
-List all available entry type templates.
-
-**Response 200:**
-```json
-{
-  "data": [
-    { "type": "note", "template": "string (markdown with front-matter)" }
-  ]
-}
-```
-
----
-
-### `GET /templates/:type`
-Get the template for a specific entry type.
-
-**Response 200:**
-```json
-{ "type": "note", "template": "string (markdown with front-matter)" }
-```
-
-**Errors:** `NOT_FOUND`.
-
----
-
-## 4. Search
-
-### `POST /search`
-Search entries using full-text or semantic search.
-
-**Request Body:**
+**Request:**
 ```json
 {
   "query": "string",
@@ -251,68 +136,100 @@ Search entries using full-text or semantic search.
 }
 ```
 
-**Errors:** `VALIDATION_ERROR`.
+**Implementation notes:**
+- `fulltext`: calls PostgreSQL `to_tsvector` + `ts_rank` via RPC.
+- `semantic`: embeds the query via the configured embedding provider, then calls the `match_entries` DB function.
+- `hybrid`: runs both, merges and re-ranks results by combined score.
+- All modes enforce user scoping internally.
 
 ---
 
-## 5. Claude Skills Integration
+### `POST /functions/v1/manage-tokens`
+Create or revoke Personal API Tokens. **Requires Supabase JWT** (not callable via PAT).
 
-These endpoints are called by Claude skill implementations running server-side.
-
-### `POST /skills/entry`
-Programmatic entry creation from a Claude skill after user approval.
-
-Same contract as `POST /entries`. Requires a valid user JWT (passed from the skill session context).
-
----
-
-### `POST /skills/rag`
-Retrieve top-N relevant entries for a RAG query within a Claude session.
-
-**Request Body:**
+**Create token:**
+```json
+{ "action": "create", "name": "Claude.ai integration" }
+```
+**Response 201:**
 ```json
 {
-  "query": "string",
-  "limit": 5,
-  "filters": {
-    "type": "entry_type | null",
-    "project_id": "uuid | null"
-  }
+  "id": "uuid",
+  "name": "Claude.ai integration",
+  "token": "sn_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "token_prefix": "sn_xxxxxx",
+  "created_at": "ISO8601"
 }
 ```
+> `token` is returned **once only**. The plaintext is never persisted server-side.
 
+**List tokens:**
+```json
+{ "action": "list" }
+```
 **Response 200:**
 ```json
 {
   "data": [
-    {
-      "id": "uuid",
-      "title": "string",
-      "type": "note",
-      "body": "string (full markdown body)",
-      "score": 0.91
-    }
+    { "id": "uuid", "name": "string", "token_prefix": "sn_xxxxxx", "last_used_at": "ISO8601|null", "created_at": "ISO8601" }
   ]
 }
 ```
 
+**Revoke token:**
+```json
+{ "action": "revoke", "token_id": "uuid" }
+```
+**Response 200:** `{ "revoked": true }`
+
+**Errors:**
+- `401` — no valid Supabase JWT.
+- `422` — missing required fields.
+- `429` — 10-token limit reached (on create).
+
 ---
 
-## 6. Export / Import
+### `POST /functions/v1/hard-delete-entry`
+Permanently deletes an entry and all associated data. Requires Supabase JWT or PAT.
 
-### `GET /export`
-Download full knowledge base as a ZIP of Markdown files.
+**Request:**
+```json
+{ "entry_id": "uuid" }
+```
 
-**Response 200:** `Content-Type: application/zip`, binary ZIP stream.
+**Response 200:** `{ "deleted": true }`
+
+**Implementation:** Deletes from `entries` (cascades to `entry_links` and `entry_embeddings`), writes to `audit_log`.
 
 ---
 
-### `POST /import`
-Import Markdown files into the knowledge base.
+### `POST /functions/v1/export`
+Exports all non-deleted entries as a ZIP of Markdown files. Returns a binary ZIP stream.
 
-**Request:** `Content-Type: multipart/form-data`, files as `file[]`.
+**Request:** Empty body (user identity from auth header).
 
-**Response 202:**
+**Response 200:** `Content-Type: application/zip`
+
+ZIP structure:
+```
+stratinote-export/
+  note/
+    my-first-note.md
+  book/
+    thinking-fast-and-slow.md
+  meeting/
+    project-alpha/
+      kickoff-2026-01-15.md
+```
+
+Each `.md` file contains the full entry with YAML front-matter (including `related_entries` populated from `entry_links`).
+
+---
+
+### `POST /functions/v1/import`
+Imports Markdown files. Accepts `multipart/form-data` with `file[]` fields.
+
+**Response 200:**
 ```json
 {
   "imported": 12,
@@ -323,28 +240,96 @@ Import Markdown files into the knowledge base.
 }
 ```
 
+Import is synchronous. Files are processed in the request; results are returned immediately. Each imported entry is queued for embedding via the `embedding_queue` trigger.
+
 ---
 
-## 7. User Profile
+### `POST /functions/v1/mcp-server`
+The Stratinote MCP server. Implements the Model Context Protocol and is registered as the Claude.ai integration endpoint. Authenticates exclusively via Personal API Token.
 
-### `GET /profile`
-Get the current user's profile.
+**MCP Tools exposed:**
 
-**Response 200:**
+| Tool | Description | Underlying operation |
+|------|-------------|---------------------|
+| `get_template` | Returns Markdown template for an entry type | `GET /rest/v1/templates?type=eq.<type>` |
+| `create_entry` | Persists a new entry from Markdown | Parses front-matter → `POST /rest/v1/entries` + resolve wiki-links |
+| `update_entry` | Updates an existing entry | `PATCH /rest/v1/entries?id=eq.<id>` |
+| `get_entry` | Retrieves an entry by ID or title | PostgREST lookup; title uses full-text match |
+| `list_projects` | Lists active project entries | `GET /rest/v1/entries?type=eq.project&status=eq.active` |
+| `search_knowledge_base` | Semantic/full-text search | Calls `search` Edge Function |
+
+**`create_entry` accepts full Markdown:**
 ```json
 {
-  "id": "uuid",
-  "display_name": "string",
-  "avatar_url": "string | null",
-  "created_at": "ISO8601"
+  "markdown": "---\ntype: note\ntitle: My Note\ntags: [ai]\n---\n\nBody here."
+}
+```
+The Edge Function parses the YAML front-matter, extracts `related_entries` (resolves to `entry_links`), and inserts the structured entry.
+
+**`search_knowledge_base` input:**
+```json
+{
+  "query": "string",
+  "limit": 5,
+  "type": "entry_type | null",
+  "project_id": "uuid | null"
+}
+```
+Returns full entry body for Claude's context window.
+
+---
+
+### `POST /functions/v1/process-embedding-queue` *(internal, cron-triggered)*
+Not user-callable. Triggered by `pg_cron` every 60 seconds. Claims pending items from `embedding_queue`, generates embeddings via the configured provider, and upserts to `entry_embeddings`.
+
+---
+
+## 3. Error Format
+
+All Edge Functions return errors in a consistent shape:
+
+```json
+{
+  "error": {
+    "code": "ENTRY_NOT_FOUND",
+    "message": "Entry with id '...' not found.",
+    "details": {}
+  }
 }
 ```
 
+Standard error codes:
+
+| Code | HTTP Status | Description |
+|------|------------|-------------|
+| `UNAUTHORIZED` | 401 | Missing or invalid auth |
+| `FORBIDDEN` | 403 | Authenticated but not the owner |
+| `NOT_FOUND` | 404 | Resource not found or not visible to user |
+| `VALIDATION_ERROR` | 422 | Input fails schema validation |
+| `CONFLICT` | 409 | Duplicate resource |
+| `RATE_LIMITED` | 429 | Too many requests |
+| `INTERNAL_ERROR` | 500 | Unexpected error |
+
+PostgREST errors follow the [PostgREST error format](https://postgrest.org/en/stable/references/errors.html) and are wrapped by the Supabase JS client.
+
 ---
 
-### `PATCH /profile`
-Update the current user's profile.
+## 4. Rate Limiting
 
-**Request Body:** `display_name`, `avatar_url` (any subset).
+Edge Functions enforce rate limiting via an in-memory sliding window per `user_id`:
 
-**Response 200:** Updated profile object.
+| Function | Limit |
+|----------|-------|
+| `search` | 30 requests/minute |
+| `export` | 5 requests/hour |
+| `import` | 10 requests/hour |
+| `manage-tokens` | 20 requests/hour |
+| `mcp-server` | 120 requests/minute |
+| All others | 120 requests/minute |
+
+PostgREST endpoints are rate-limited at the Supabase project level (configurable in project settings).
+
+Responses include:
+- `X-RateLimit-Limit`
+- `X-RateLimit-Remaining`
+- `X-RateLimit-Reset` (Unix timestamp)

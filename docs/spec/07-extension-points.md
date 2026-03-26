@@ -38,90 +38,107 @@ ALTER TYPE entry_type ADD VALUE '<new-type>';
 
 ### Step 3 — Define the metadata schema
 
-Add a metadata validation schema to:
+Add a metadata validation schema to the `mcp-server` Edge Function:
 ```
-src/schemas/metadata/<new-type>.schema.ts
+supabase/functions/mcp-server/schemas/<new-type>.ts
 ```
 
-Export a Zod schema. The system automatically picks it up by convention:
+Export a Zod schema:
 ```ts
 export const newTypeMetadataSchema = z.object({
-  // your fields
+  // your type-specific fields
 });
 ```
 
-### Step 4 — (Optional) Register a Claude skill
+Register it in `supabase/functions/mcp-server/schemas/index.ts`:
+```ts
+export const metadataSchemas: Record<EntryType, ZodSchema> = {
+  // ...existing
+  'new-type': newTypeMetadataSchema,
+};
+```
 
-See §3 below to add a `/new-<type>` Claude skill.
+### Step 4 — (Optional) Add an MCP tool
+
+See §3 below to add a new MCP tool for the type (e.g. a specialised creation flow).
 
 ### No other changes required.
 
-The entry CRUD endpoints, search, embedding, and export functions handle all types generically.
+PostgREST handles CRUD generically. The `search`, `export`, and `import` Edge Functions handle all types without modification.
 
 ---
 
 ## 2. Adding a New Metadata Field to an Existing Type
 
-1. Update the template file for the type.
-2. Update the Zod metadata schema for the type to add the new field (as `optional()` to maintain backward compatibility).
-3. Create a Supabase migration if any new database column or index is needed.
-4. Add a test case to the unit tests for the updated schema.
+1. Update the template row in the `templates` table via a Supabase migration.
+2. Update the Zod schema for the type in the `mcp-server` Edge Function (add new field as `.optional()` for backward compatibility).
+3. Create a Supabase migration if a new index is needed for the field.
+4. Add a test case to the Edge Function unit tests.
 
 ---
 
-## 3. Adding a New Claude Skill
+## 3. Adding a New MCP Tool
 
-Skills are registered in a skill registry file:
+MCP tools are registered in the `mcp-server` Edge Function:
 ```
-src/skills/registry.ts
+supabase/functions/mcp-server/tools/index.ts
 ```
 
-Each skill is an object conforming to the `Skill` interface:
+Each tool is an object conforming to the `MCPTool` interface:
 
 ```ts
-interface Skill {
-  name: string;              // e.g. "new-note"
-  command: string;           // e.g. "/new-note"
-  description: string;
-  entryType?: EntryType;     // if this skill creates an entry
-  handler: SkillHandler;     // async function (session, args) => SkillResult
+interface MCPTool {
+  name: string;              // e.g. "create_note"
+  description: string;       // shown to Claude to decide when to use the tool
+  inputSchema: ZodSchema;    // typed input; Claude uses this to format calls
+  handler: (input: unknown, userId: string) => Promise<MCPToolResult>;
 }
 ```
 
-To add a new skill:
-1. Create a handler in `src/skills/handlers/<skill-name>.ts`.
-2. Register it in `src/skills/registry.ts`.
-3. The dispatcher automatically routes `/new-skill-name` to the handler.
+To add a new tool:
+1. Create a handler in `supabase/functions/mcp-server/tools/<tool-name>.ts`.
+2. Register it in `supabase/functions/mcp-server/tools/index.ts`.
+3. The MCP dispatcher routes tool calls by name automatically.
+4. Deploy the updated Edge Function: `supabase functions deploy mcp-server`.
 
-No changes to the core dispatcher are needed.
+No other changes needed.
 
 ---
 
 ## 4. Swapping the Embedding Model
 
-The embedding service is abstracted behind an interface:
+The embedding logic lives in `supabase/functions/process-embedding-queue/providers/`. It is abstracted behind an interface:
 
 ```ts
 interface EmbeddingProvider {
   embed(text: string): Promise<number[]>;
-  dimensions: number;
-  modelName: string;
+  readonly dimensions: number;
+  readonly modelName: string;
 }
 ```
 
 To add a new provider:
-1. Create a new class implementing `EmbeddingProvider` in `src/embedding/providers/<provider-name>.ts`.
-2. Set the environment variable:
+1. Create a new file implementing `EmbeddingProvider` in `supabase/functions/process-embedding-queue/providers/<name>.ts`.
+2. Register it in the provider factory in the same directory.
+3. Update Supabase project secrets:
    ```
-   EMBEDDING_PROVIDER=<provider-name>
+   EMBEDDING_PROVIDER=<name>
+   EMBEDDING_MODEL=<model-id>
+   EMBEDDING_DIMENSIONS=<int>
    ```
-3. The provider factory (`src/embedding/factory.ts`) instantiates the correct provider at startup.
 
-**Important:** If you change the embedding model, all existing embeddings must be regenerated. Use the admin script:
+**Important — model change requires a migration:**
+If you change the embedding dimensions, the `entry_embeddings.embedding` column type must be updated. Run:
+```sql
+-- In a new Supabase migration
+ALTER TABLE entry_embeddings ALTER COLUMN embedding TYPE vector(<new-dimensions>);
 ```
-npm run reembed-all
+Then re-queue all entries for re-embedding:
+```sql
+INSERT INTO embedding_queue (entry_id, status)
+SELECT id, 'pending' FROM entries WHERE deleted_at IS NULL
+ON CONFLICT (entry_id) DO UPDATE SET status = 'pending', attempts = 0;
 ```
-This re-queues all entries in `embedding_queue` for reprocessing.
 
 ---
 
@@ -140,39 +157,40 @@ No backend API changes are needed; Supabase handles the OAuth flow.
 
 ## 6. Adding a New Search Mode
 
-The search service is structured around named search strategies:
+The `search` Edge Function is structured around named search strategies:
 
 ```ts
 interface SearchStrategy {
-  name: string;                     // e.g. "semantic", "fulltext", "hybrid"
-  search(query: SearchQuery): Promise<SearchResult[]>;
+  name: string;
+  search(query: SearchQuery, userId: string): Promise<SearchResult[]>;
 }
 ```
 
 To add a new search strategy:
-1. Implement the `SearchStrategy` interface in `src/search/strategies/<name>.ts`.
-2. Register it in `src/search/registry.ts`.
-3. The `POST /search` endpoint accepts any registered `mode` value.
+1. Create a file in `supabase/functions/search/strategies/<name>.ts`.
+2. Register it in `supabase/functions/search/strategies/index.ts`.
+3. The `mode` field in the search request will now accept the new name.
+4. Deploy: `supabase functions deploy search`.
 
 ---
 
 ## 7. Feature Flags
 
-For larger features that should be rolled out gradually, the system supports environment-variable-based feature flags:
+For larger features that should be rolled out gradually, Supabase project secrets act as feature flags:
 
 ```
 FEATURE_IMPORT_EXPORT=true
 FEATURE_OAUTH=false
 ```
 
-Feature flags are checked at runtime via a `isFeatureEnabled(flag)` utility. They are documented in `.env.example`.
+Edge Functions read these at runtime via `Deno.env.get('FEATURE_X')`. Frontend flags are prefixed `NEXT_PUBLIC_FEATURE_X` in `.env.local`. All flags are documented in `.env.example`.
 
 ---
 
-## 8. Versioning the API
+## 8. Versioning Edge Functions
 
-The API is versioned under `/api/v1`. When breaking changes are needed:
-1. Create a new router at `/api/v2`.
-2. Implement changed endpoints in `src/api/v2/`.
-3. Maintain `/api/v1` until all clients have migrated.
-4. Deprecation notices are added to `/api/v1` response headers: `Deprecation: true`, `Sunset: <date>`.
+Edge Functions are versioned by deploying updated code:
+- Breaking changes to an Edge Function's API should be introduced as a new function name (e.g. `search-v2`).
+- The old function remains deployed until all clients migrate.
+- Deprecation is communicated via a `Deprecation: true` response header and a documented sunset date.
+- PostgREST schema changes follow the Supabase migration versioning system (`supabase/migrations/`).

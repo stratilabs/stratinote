@@ -129,58 +129,95 @@ A `project` entry acts as a container. `meeting` entries and other project-scope
 
 ---
 
-## 2. Claude AI Integration
+## 2. Claude AI Integration (MCP)
 
-### FR-006 — Claude Entry Creation Skill
-**Priority:** P1
-
-The system shall expose Claude Skills (prompt commands) that guide the user through creating a new entry interactively in a Claude session.
-
-**Acceptance Criteria:**
-- Skills available: `/new-note`, `/new-idea`, `/new-article`, `/new-book`, `/new-project`, `/new-meeting`.
-- Each skill loads the appropriate template and prompts the user for content conversationally.
-- The session maintains context of the in-progress entry across multiple turns.
-- The user can iterate on the entry content within the same session before committing.
-- The skill presents the final Markdown for user approval before storing.
+The Claude AI integration is implemented as a **Model Context Protocol (MCP) server** registered as a Claude.ai integration. The user connects it once in their Claude.ai settings. Authentication between Claude.ai and the MCP server uses a **Personal API Token** (see FR-022). Claude calls MCP tools during conversation; the user never writes raw API calls.
 
 ---
 
-### FR-007 — Entry Storage via Claude
+### FR-006 — MCP Server and Tool Registration
 **Priority:** P1
 
-After the user approves the entry in a Claude session, the skill shall persist the entry to Supabase.
+The system shall implement a Stratinote MCP server that registers the following tools with Claude.ai:
+
+| Tool | Purpose |
+|------|---------|
+| `get_template` | Returns the Markdown template for a given entry type |
+| `create_entry` | Persists a completed, user-approved entry |
+| `update_entry` | Updates an existing entry by ID |
+| `search_knowledge_base` | Semantic search over the user's knowledge base |
+| `get_entry` | Retrieves a single entry by ID or title |
+| `list_projects` | Lists available project entries for meeting linking |
 
 **Acceptance Criteria:**
-- The entry is validated against the entry type schema before storage.
-- The embedding is generated and stored at write time.
-- On success, the skill responds with the entry ID and a link to the web UI.
-- On failure, the error is surfaced in the session with a retry option.
+- The MCP server implements the MCP protocol spec and is registerable in Claude.ai as a remote integration.
+- Each tool has a clear name, description, and typed input schema so Claude can invoke it correctly without user guidance.
+- All tool calls are authenticated via the Personal API Token in the request header (see FR-022).
+- A tool call with an invalid or expired token returns a structured MCP error; Claude surfaces this to the user.
+- The MCP server is a standalone deployable service (or Next.js API route group) separate from the web-facing REST API.
 
 ---
 
-### FR-008 — Semantic Retrieval (RAG) in Claude Sessions
+### FR-007 — Conversational Entry Creation via Claude.ai
 **Priority:** P1
 
-During a Claude session, the user shall be able to ask questions or request related context, and the system shall retrieve semantically relevant entries from the knowledge base.
+The Claude.ai integration shall enable the user to create a new entry through natural conversation, without manually filling in templates.
+
+**Flow:**
+1. User asks Claude to capture a new note, book summary, idea, etc.
+2. Claude calls `get_template` for the appropriate entry type.
+3. Claude guides the user conversationally to provide the required content.
+4. Claude assembles the final Markdown with front-matter and presents it to the user for review.
+5. User approves (or asks for changes and iterates).
+6. Claude calls `create_entry` with the final Markdown.
+7. Claude confirms with the entry ID and a link to the web UI entry page.
 
 **Acceptance Criteria:**
-- A `/search <query>` skill performs semantic search and returns the top-N most relevant entries.
-- Retrieved entries are injected into the Claude context window with source attribution.
-- RAG is available in any Claude session, not only entry-creation flows.
-- Only entries owned by the authenticated user are searched.
-- The number of retrieved results (top-N) is configurable; default is 5.
+- The user never needs to write YAML front-matter manually; Claude fills it from the conversation.
+- The user can request changes and re-review before committing (multi-turn iteration).
+- `create_entry` validates the Markdown against the entry type schema server-side before persisting; validation errors are returned as tool errors and surfaced by Claude.
+- On success, the MCP tool returns the entry ID and a direct URL to the web UI.
+- On failure, Claude surfaces the error and offers to retry.
+- Supported entry types: `note`, `idea`, `article`, `book`, `project`, `meeting`.
 
 ---
 
-### FR-009 — Contextual Knowledge Use in Creative Work
+### FR-008 — Semantic Knowledge Retrieval (RAG) via Claude.ai
+**Priority:** P1
+
+During any Claude.ai session with the Stratinote integration active, Claude shall be able to retrieve semantically relevant entries from the user's knowledge base to answer questions or provide context.
+
+**Flow:**
+1. User asks a question or requests context ("what do I know about X?").
+2. Claude calls `search_knowledge_base` with a semantic query.
+3. The MCP server calls the backend search API using the Personal API Token.
+4. Retrieved entries (title, excerpt, entry ID) are returned to Claude.
+5. Claude answers using the retrieved content, citing the entry titles as sources.
+
+**Acceptance Criteria:**
+- `search_knowledge_base` accepts: `query` (string), `limit` (int, default 5, max 20), optional `type` and `project_id` filters.
+- Only entries belonging to the token's owner are searched.
+- Retrieved entries include full body content so Claude has complete context.
+- Claude attributes answers to specific entries by title.
+- RAG works in any conversation, not only entry-creation flows.
+
+---
+
+### FR-009 — Contextual Entry Pinning via Claude.ai
 **Priority:** P2
 
-The user shall be able to reference their knowledge base entries as context when working on creative or analytical tasks in a Claude session.
+The user shall be able to explicitly load specific entries into a Claude.ai conversation context by referencing them by title or ID.
+
+**Flow:**
+1. User tells Claude "use my notes on [[Topic X]] for this".
+2. Claude calls `get_entry` with the title or ID.
+3. The entry content is returned and held in the conversation context.
+4. Claude uses it for the remainder of the session.
 
 **Acceptance Criteria:**
-- The user can pin specific entries into session context via `/use [[entry-title]]`.
-- Pinned entries are summarised and injected into the system prompt for the session.
-- Multiple entries can be pinned simultaneously.
+- `get_entry` accepts either an entry UUID or an entry title (resolved server-side).
+- Multiple entries can be fetched and used in the same session.
+- If the entry is not found or doesn't belong to the user, a clear error is returned.
 
 ---
 
@@ -339,3 +376,50 @@ Users shall be able to import Markdown files (with compatible front-matter) into
 - System validates front-matter on import; invalid files are reported with details.
 - Duplicate detection by title + type; user is prompted to skip or overwrite.
 - Imported entries are embedded on ingest.
+
+---
+
+## 7. Personal API Token Management
+
+### FR-022 — Personal API Token Generation
+**Priority:** P1
+
+Users shall be able to generate Personal API Tokens (PATs) from the web UI to authenticate the Claude.ai MCP integration.
+
+**Acceptance Criteria:**
+- A user can generate one or more named PATs (e.g. "Claude.ai integration", "Home laptop").
+- The full token value is shown **once** at creation time and never again; only a masked prefix is stored.
+- A PAT grants the same data access as the generating user, scoped by the same RLS policies.
+- PATs do not expire by default but can be revoked individually at any time from the web UI.
+- Revoking a PAT immediately invalidates all API calls using that token (no grace period).
+- The `api_tokens` table stores only the hashed token value (SHA-256); the plaintext is never persisted.
+- A user may have at most 10 active PATs simultaneously.
+
+---
+
+### FR-023 — PAT Authentication on API and MCP
+**Priority:** P1
+
+The backend API and MCP server shall accept Personal API Tokens as a valid authentication method, in addition to Supabase JWTs.
+
+**Acceptance Criteria:**
+- A request with `Authorization: Bearer <pat>` is authenticated by hashing the token and looking it up in `api_tokens`.
+- If the token is valid and not revoked, the request proceeds as the owning user.
+- Invalid or revoked tokens return HTTP 401.
+- PAT usage is logged (last-used timestamp updated on each call) for audit purposes.
+- PAT authentication is available on all `/api/v1/*` endpoints except `POST /auth/token` (which issues PATs and requires a Supabase JWT).
+
+---
+
+## 8. Entry Linking — Clarification of Mechanisms
+
+### FR-024 — Single Source of Truth for Entry Links
+**Priority:** P1
+
+Entry cross-links are stored exclusively in the `entry_links` table. The `related_entries` field in Markdown front-matter is a **display convenience** rendered from `entry_links` on read and resolved to `entry_links` on write. There is no separate storage of link data in the `metadata` JSON column.
+
+**Acceptance Criteria:**
+- On entry save, any `related_entries` values in the front-matter are parsed, resolved to entry IDs, and written to `entry_links`. The field is then stripped from the stored `metadata`.
+- On entry read, the API populates `related_entries` in the response by querying `entry_links`, so consumers always see a consistent view.
+- Wiki-style `[[title]]` links found in the entry body are resolved and added to `entry_links` at save time.
+- Unresolvable `[[title]]` references are preserved as-is in the body and flagged as warnings; no `entry_link` row is created for them.

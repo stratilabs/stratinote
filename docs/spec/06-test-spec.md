@@ -6,18 +6,21 @@
 
 ### Layers
 
-| Layer | Scope | Tooling (suggested) |
-|-------|-------|---------------------|
-| **Unit** | Individual functions, validators, utilities | Vitest / Jest |
-| **Integration** | API endpoints against a real Supabase test instance | Vitest + Supertest |
+| Layer | Scope | Tooling |
+|-------|-------|---------|
+| **Unit** | Edge Function logic: validators, parsers, search strategies, PAT hashing | Deno test (`deno test`) or Vitest |
+| **Integration** | Edge Functions + PostgREST against a local Supabase instance (`supabase start`) | Vitest + `fetch` |
+| **RLS** | Database-level policy tests using `supabase test db` (pgTAP) | pgTAP |
 | **E2E** | Full user flows in the browser | Playwright |
-| **Security** | Auth bypass, RLS, injection, rate limiting | Vitest + manual |
+| **Security** | Auth bypass, cross-user RLS, injection, rate limiting | Vitest integration tests + manual |
+| **Performance** | Load and latency tests | k6 |
 
 ### Principles
-- Tests are co-located with the code they test (`*.test.ts` / `*.spec.ts`).
-- Integration tests use a dedicated Supabase test project with isolated data, reset between test suites.
+- Edge Function unit tests are co-located with the function code (`*.test.ts`).
+- Integration and RLS tests run against a local Supabase instance started with `supabase start`. Data is seeded and reset between test suites via SQL fixtures.
 - No production data is used in tests.
 - Each test is independent and does not rely on execution order.
+- CI pipeline: unit and integration tests run on every PR; E2E tests run on merge to main.
 - Test IDs (`T-XXX`) correspond to functional requirements (`FR-XXX`) where applicable.
 
 ---
@@ -111,10 +114,12 @@ THEN HTTP 429 is returned with a Retry-After header
 
 ## 3. Integration Tests
 
+> Integration tests call PostgREST and Edge Functions running on `supabase start` (local) using a test user JWT.
+
 ### T-I001 — Full Entry Lifecycle (FR-003)
 ```
 GIVEN an authenticated user
-WHEN they create, read, update, and soft-delete an entry
+WHEN they create, read, update, and soft-delete an entry via PostgREST
 THEN each operation returns the expected response and database state
 ```
 
@@ -184,6 +189,42 @@ THEN a ZIP file is returned
 AND the ZIP contains 3 .md files in folders named by type
 AND each file contains valid front-matter
 ```
+
+### T-I010a — PAT Create, Use, and Revoke (FR-022, FR-023)
+```
+GIVEN an authenticated user (Supabase JWT)
+WHEN they call manage-tokens Edge Function with action=create
+THEN a token is returned in plaintext (one time only)
+AND the token_hash is stored in api_tokens
+
+WHEN they call the search Edge Function with the PAT as Bearer token
+THEN the call succeeds and returns results scoped to their entries
+
+WHEN they revoke the PAT via action=revoke
+THEN subsequent calls with that PAT return HTTP 401
+
+WHEN they call manage-tokens with action=create using a PAT (not JWT)
+THEN HTTP 401 is returned
+```
+
+---
+
+### T-I010b — Embedding Queue Processing (FR-018)
+```
+GIVEN a new entry is created via PostgREST
+THEN a row in embedding_queue has status='pending' within 1 second (trigger fires)
+
+WHEN the process-embedding-queue Edge Function is invoked
+THEN the queue row transitions to status='done'
+AND an embedding row exists in entry_embeddings for the entry
+
+GIVEN the embedding provider API returns an error
+WHEN the Edge Function processes the queue item
+THEN attempts is incremented and status remains 'pending' (up to 3 retries)
+AFTER 3 failures THEN status='failed' and last_error is populated
+```
+
+---
 
 ### T-I010 — Import (FR-021)
 ```
@@ -358,18 +399,42 @@ THEN it is redirected to HTTPS with HTTP 301
 
 ---
 
-## 6. Performance Tests
+## 6. Failure and Degradation Tests
 
-### T-P001 — API Response Time (NFR-001)
+### T-F001 — Embedding Service Unavailable (NFR-010)
 ```
-GIVEN 1,000 sequential API requests to GET /entries
+GIVEN the embedding provider API is unavailable (simulated via env var override)
+WHEN a new entry is created via PostgREST
+THEN the entry is persisted successfully (HTTP 201)
+AND the embedding_queue row is marked status='pending'
+AND the web UI displays the entry (without semantic search availability)
+AND no error is surfaced to the user during creation
+```
+
+### T-F002 — MCP Server Unavailable
+```
+GIVEN the mcp-server Edge Function is down
+WHEN the user calls a tool from Claude.ai
+THEN Claude.ai surfaces a connection error (not a data corruption)
+AND all existing entries remain intact in the database
+```
+
+---
+
+## 7. Performance Tests
+
+> Performance tests use **k6**. Scripts live in `tests/performance/`.
+
+### T-P001 — PostgREST Response Time (NFR-001)
+```
+GIVEN 1,000 sequential requests to list entries (PostgREST)
 THEN 95% of responses complete in under 500ms
 ```
 
 ### T-P002 — Semantic Search Latency (NFR-002)
 ```
 GIVEN a user with 10,000 entries and embeddings
-WHEN POST /search with mode semantic is called
+WHEN the search Edge Function is called with mode=semantic
 THEN the response completes in under 2,000ms
 ```
 
@@ -377,4 +442,11 @@ THEN the response completes in under 2,000ms
 ```
 GIVEN 100 simulated concurrent users each reading and writing entries
 THEN no requests timeout and response times remain within NFR-001 bounds
+```
+
+### T-P004 — Embedding Queue Throughput
+```
+GIVEN 500 entries in embedding_queue with status='pending'
+WHEN the process-embedding-queue Edge Function runs
+THEN all items are processed within 10 minutes (accounting for provider rate limits)
 ```

@@ -112,17 +112,41 @@ Explicit cross-links between entries. Supports the `related_entries` field and w
 
 Stores the vector embedding for each entry. Separated from `entries` to keep the main table lean.
 
+The vector dimension is determined by the configured embedding model and is set at deployment time via the `EMBEDDING_DIMENSIONS` environment variable. The default model is `text-embedding-3-small` (1536 dimensions). Changing models requires a schema migration to update the column type and a full re-embedding of all entries.
+
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
 | `entry_id` | `uuid` | PK, FK → `entries.id` ON DELETE CASCADE | One-to-one with entries |
-| `embedding` | `vector(1536)` | NOT NULL | pgvector embedding |
+| `embedding` | `vector(EMBEDDING_DIMENSIONS)` | NOT NULL | pgvector embedding; dimension set at deploy time |
 | `model` | `text` | NOT NULL | Embedding model used (e.g. `text-embedding-3-small`) |
 | `generated_at` | `timestamptz` | NOT NULL, DEFAULT now() | |
 
 **Indexes:**
-- IVFFlat index on `embedding vector_cosine_ops` for ANN search.
+- IVFFlat index on `embedding vector_cosine_ops` for ANN search. Built after initial data load; not maintained in real-time (pgvector handles incremental updates).
 
-**RLS:** Users can only access embeddings for their own entries (via join on `entries.user_id`).
+**RLS:** Direct user access is blocked (`USING (false)`). Embeddings are read exclusively via the `match_entries` Postgres function (defined below) which uses `SECURITY DEFINER` and enforces user scoping internally.
+
+---
+
+### `api_tokens`
+
+Stores Personal API Tokens used to authenticate MCP tool calls from Claude.ai.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `id` | `uuid` | PK, DEFAULT gen_random_uuid() | |
+| `user_id` | `uuid` | NOT NULL, FK → `auth.users.id` ON DELETE CASCADE | Token owner |
+| `name` | `text` | NOT NULL | User-assigned label (e.g. "Claude.ai") |
+| `token_hash` | `text` | NOT NULL, UNIQUE | SHA-256 hash of the plaintext token |
+| `token_prefix` | `text` | NOT NULL | First 8 chars of the token for display (e.g. `sn_abc123`) |
+| `last_used_at` | `timestamptz` | NULLABLE | Updated on each successful use |
+| `revoked_at` | `timestamptz` | NULLABLE | Set when token is revoked |
+| `created_at` | `timestamptz` | NOT NULL, DEFAULT now() | |
+
+**Constraints:**
+- CHECK: a user may not have more than 10 non-revoked tokens (enforced via trigger).
+
+**RLS:** Users can only read and delete their own tokens. Insert is via a server-side function that generates the token, hashes it, and returns the plaintext once.
 
 ---
 
@@ -146,29 +170,27 @@ Tracks entries awaiting (re)embedding after creation or update. Enables async, r
 
 ## Metadata Schemas (per Entry Type)
 
-These are enforced at the application layer. The `metadata` jsonb column stores any fields beyond the base `entries` columns.
+These are enforced at the application layer. The `metadata` jsonb column stores type-specific fields beyond the base `entries` columns.
+
+**Important:** `related_entries` is **not** stored in `metadata`. Links are stored exclusively in the `entry_links` table (see FR-024). When the API returns an entry, it populates `related_entries` dynamically from `entry_links` for convenience. On write, any `related_entries` values in incoming front-matter are resolved and written to `entry_links`, then removed from `metadata` before persistence.
 
 ### `note`
 ```jsonb
-{
-  "related_entries": ["uuid", ...]   // optional
-}
+{}
 ```
+*(no type-specific metadata beyond base columns)*
 
 ### `idea`
 ```jsonb
-{
-  "related_entries": ["uuid", ...]   // optional
-}
+{}
 ```
 
 ### `article`
 ```jsonb
 {
   "source_url": "string",            // optional
-  "author": "string",                // optional
-  "published_date": "date",          // optional
-  "related_entries": ["uuid", ...]
+  "article_author": "string",        // optional
+  "published_date": "date"           // optional ISO 8601
 }
 ```
 
@@ -177,26 +199,46 @@ These are enforced at the application layer. The `metadata` jsonb column stores 
 {
   "book_author": "string",           // required
   "isbn": "string",                  // optional
-  "rating": 1-5,                     // optional
-  "reading_status": "to-read|reading|completed",  // required
-  "related_entries": ["uuid", ...]
+  "rating": 1,                       // optional, integer 1–5
+  "reading_status": "to-read"        // required: to-read | reading | completed
 }
 ```
 
 ### `project`
 ```jsonb
-{
-  "related_entries": ["uuid", ...]
-}
+{}
 ```
 
 ### `meeting`
 ```jsonb
 {
-  "meeting_date": "date",            // required
-  "attendees": ["string", ...],      // optional
-  "related_entries": ["uuid", ...]
+  "meeting_date": "2026-01-15",      // required ISO 8601 date
+  "attendees": ["Alice", "Bob"]      // optional
 }
+```
+
+---
+
+## Database Functions
+
+### `match_entries(query_embedding vector, match_count int, p_user_id uuid)`
+`SECURITY DEFINER` function used for semantic search. Bypasses RLS on `entry_embeddings` internally but enforces user scoping via the `p_user_id` parameter joined against `entries.user_id`. Returns ranked entries with cosine similarity scores.
+
+```sql
+-- Signature only; implementation in migration
+CREATE OR REPLACE FUNCTION match_entries(
+  query_embedding vector,
+  match_count     int,
+  p_user_id       uuid
+)
+RETURNS TABLE (
+  id       uuid,
+  title    text,
+  body     text,
+  type     entry_type,
+  score    float
+)
+LANGUAGE plpgsql SECURITY DEFINER;
 ```
 
 ---
@@ -207,7 +249,25 @@ These are enforced at the application layer. The `metadata` jsonb column stores 
 On `INSERT INTO auth.users` → creates a corresponding row in `profiles`.
 
 ### `set_updated_at`
-On `UPDATE` of `entries` or `profiles` → sets `updated_at = now()`.
+On `UPDATE` of `entries`, `profiles`, `embedding_queue` → sets `updated_at = now()`.
 
 ### `queue_embedding_on_change`
-On `INSERT OR UPDATE` of `entries` → inserts or updates a row in `embedding_queue` with `status = 'pending'`.
+On `INSERT OR UPDATE` of `entries` (when `title` or `body` changes) → upserts a row in `embedding_queue` with `status = 'pending'`.
+
+### `enforce_token_limit`
+On `INSERT INTO api_tokens` → raises an exception if the user already has 10 non-revoked tokens.
+
+---
+
+## Embedding Queue Worker
+
+The `embedding_queue` table is processed by a **Supabase Edge Function** (`process-embedding-queue`) triggered on a cron schedule (every 60 seconds via `pg_cron`). The function:
+
+1. Claims up to 10 `pending` rows (sets `status = 'processing'`).
+2. Fetches each entry's `title || '\n\n' || body` text.
+3. Calls the configured embedding provider API.
+4. Upserts the result into `entry_embeddings`.
+5. Sets the queue row to `done` or `failed` (with `last_error`).
+6. Retries up to 3 times before marking `failed` permanently.
+
+This design ensures entry saves are never blocked by embedding latency and embedding generation is retryable without data loss.
