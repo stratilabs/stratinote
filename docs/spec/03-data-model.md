@@ -6,9 +6,13 @@
 
 ```
 profiles (1) ──── (N) entries
-entries   (N) ──── (N) entries         [via entry_links]
-entries   (N) ──── (1) projects        [meeting.project_id → entry.id where type='project']
+profiles (1) ──── (N) entry_type_definitions   [user-owned types]
+entry_type_definitions (1) ──── (N) field_definitions
+entry_type_definitions (1) ──── (N) entries    [via type_definition_id]
+entries   (N) ──── (N) entries                 [via entry_links]
 entries   (1) ──── (1) entry_embeddings
+auth.users (1) ──── (N) api_tokens
+auth.users (1) ──── (N) invites                [created_by]
 ```
 
 ---
@@ -24,53 +28,95 @@ Extends Supabase Auth `auth.users`. Created automatically on first sign-in via a
 | `id` | `uuid` | PK, FK → `auth.users.id` | Matches Auth user ID |
 | `display_name` | `text` | NOT NULL | User's chosen display name |
 | `avatar_url` | `text` | NULLABLE | URL to avatar image |
+| `is_superadmin` | `boolean` | NOT NULL, DEFAULT false | Superadmin flag; set only via DB migration, never via API |
+| `last_active_at` | `timestamptz` | NULLABLE | Updated on authenticated activity for health metrics |
+| `suspended_at` | `timestamptz` | NULLABLE | Set when superadmin suspends the account |
 | `created_at` | `timestamptz` | NOT NULL, DEFAULT now() | |
 | `updated_at` | `timestamptz` | NOT NULL, DEFAULT now() | |
 
-**RLS:** Users can only read and update their own profile.
+**RLS:**
+- Users can read and update their own profile (except `is_superadmin` and `suspended_at`).
+- Superadmins can read all profiles and update `suspended_at`.
 
 ---
 
-### `entries`
+### `entry_type_definitions`
 
-The core table. All entry types are stored here; type-specific data lives in the `metadata` JSON column and is validated at the application layer.
+Defines a schema for an entry type. Can be owned by the system (superadmin-managed) or by a user.
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
 | `id` | `uuid` | PK, DEFAULT gen_random_uuid() | |
-| `user_id` | `uuid` | NOT NULL, FK → `auth.users.id` | Owner |
-| `type` | `entry_type` (enum) | NOT NULL | See entry types enum |
-| `title` | `text` | NOT NULL | Entry title |
-| `body` | `text` | NOT NULL, DEFAULT '' | Markdown body (excluding front-matter) |
-| `metadata` | `jsonb` | NOT NULL, DEFAULT '{}' | Type-specific front-matter fields |
-| `tags` | `text[]` | NOT NULL, DEFAULT '{}' | Searchable tags |
-| `status` | `entry_status` (enum) | NOT NULL, DEFAULT 'draft' | |
-| `project_id` | `uuid` | NULLABLE, FK → `entries.id` | Set for `meeting` and project-scoped entries |
+| `slug` | `text` | NOT NULL, UNIQUE | URL-safe identifier (e.g. `book`, `my-meeting-v2`) |
+| `name` | `text` | NOT NULL | Display name (e.g. "Book Review") |
+| `description` | `text` | NULLABLE | Optional description shown in the type picker |
+| `icon` | `text` | NULLABLE | Icon identifier (emoji or icon name) |
+| `color` | `text` | NULLABLE | Hex color for visual identity |
+| `owner_type` | `text` | NOT NULL | `system` or `user` |
+| `owner_id` | `uuid` | NULLABLE, FK → `auth.users.id` | NULL for system types; user ID for user types |
+| `layer` | `text` | NOT NULL, DEFAULT 'knowledge_base' | `knowledge_base` or `project_workspace` |
+| `is_deprecated` | `boolean` | NOT NULL, DEFAULT false | Hidden from creation picker; existing entries unaffected |
+| `forked_from_slug` | `text` | NULLABLE, FK → `entry_type_definitions.slug` | Set when a user forks a system type |
+| `schema_version` | `integer` | NOT NULL, DEFAULT 1 | Incremented on any field definition change |
 | `created_at` | `timestamptz` | NOT NULL, DEFAULT now() | |
 | `updated_at` | `timestamptz` | NOT NULL, DEFAULT now() | |
-| `deleted_at` | `timestamptz` | NULLABLE | Soft delete timestamp |
 
-**Indexes:**
-- `(user_id, type)` — filtered list queries
-- `(user_id, status)` — status filtering
-- `(project_id)` — project workspace queries
-- `(tags)` — GIN index for array containment queries
-- Full-text: GIN index on `to_tsvector('english', title || ' ' || body)`
+**Constraints:**
+- CHECK: `owner_type = 'system' AND owner_id IS NULL` OR `owner_type = 'user' AND owner_id IS NOT NULL`
+- UNIQUE `(slug)` — global uniqueness; user-defined types auto-prefix with a short user hash to avoid collisions
 
-**RLS:** Users can only access rows where `user_id = auth.uid()` and `deleted_at IS NULL`.
+**RLS:**
+- System types (`owner_type = 'system'`) are readable by all authenticated users, mutable by superadmins only.
+- User types are readable and mutable by the owning user only.
 
 ---
 
-### `entry_type` (enum)
+### `field_definitions`
+
+Defines an individual field within an entry type definition.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `id` | `uuid` | PK, DEFAULT gen_random_uuid() | |
+| `type_definition_id` | `uuid` | NOT NULL, FK → `entry_type_definitions.id` ON DELETE CASCADE | Parent type |
+| `field_key` | `text` | NOT NULL | Unique slug within the type (e.g. `book_author`, `summary`) |
+| `label` | `text` | NOT NULL | Display name shown in editor and to Claude (e.g. "Key Insights") |
+| `field_type` | `field_type` (enum) | NOT NULL | See enum below |
+| `display_group` | `text` | NOT NULL, DEFAULT 'properties' | `properties` (strip) or `document` (body section) |
+| `order` | `integer` | NOT NULL, DEFAULT 0 | Sort order within `display_group` |
+| `required` | `boolean` | NOT NULL, DEFAULT false | |
+| `default_value` | `jsonb` | NULLABLE | Pre-populated value for new entries |
+| `options` | `jsonb` | NULLABLE | Array of `{value: string, label: string}` for select/multi_select |
+| `entry_reference_type` | `text` | NULLABLE | For `entry_reference`: constrains target to a specific type slug |
+| `hint` | `text` | NULLABLE | Helper text shown beneath the field in the editor |
+| `is_deprecated` | `boolean` | NOT NULL, DEFAULT false | Hidden in editor; data preserved |
+| `created_at` | `timestamptz` | NOT NULL, DEFAULT now() | |
+
+**Constraints:**
+- UNIQUE `(type_definition_id, field_key)`
+- CHECK: `field_key ~ '^[a-z][a-z0-9_]*$'`
+- CHECK: `field_type NOT IN ('select', 'multi_select') OR (options IS NOT NULL AND jsonb_array_length(options) > 0)`
+- `field_type` cannot be updated after the field has been used in any entry (enforced via trigger)
+
+**RLS:** Inherits access from parent `entry_type_definitions` row.
+
+---
+
+### `field_type` (enum)
 
 ```sql
-CREATE TYPE entry_type AS ENUM (
-  'note',
-  'idea',
-  'article',
-  'book',
-  'project',
-  'meeting'
+CREATE TYPE field_type AS ENUM (
+  'text',
+  'long_text',
+  'markdown',
+  'date',
+  'datetime',
+  'number',
+  'url',
+  'select',
+  'multi_select',
+  'boolean',
+  'entry_reference'
 );
 ```
 
@@ -89,19 +135,56 @@ CREATE TYPE entry_status AS ENUM (
 
 ---
 
+### `entries`
+
+The core table. All field values are stored in `metadata` keyed by `field_key`. The `body` column is removed; `search_text` is a generated column for full-text indexing.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `id` | `uuid` | PK, DEFAULT gen_random_uuid() | |
+| `user_id` | `uuid` | NOT NULL, FK → `auth.users.id` | Owner |
+| `type_definition_id` | `uuid` | NOT NULL, FK → `entry_type_definitions.id` | Resolves the schema |
+| `type_slug` | `text` | NOT NULL | Denormalized slug for fast filtering without JOIN |
+| `schema_version` | `integer` | NOT NULL | Schema version at write time; for future migration tooling |
+| `title` | `text` | NOT NULL | Always present; used for display, search, wiki-link resolution |
+| `metadata` | `jsonb` | NOT NULL, DEFAULT '{}' | All field values: `{ "field_key": value, ... }` |
+| `search_text` | `text` | GENERATED ALWAYS AS (...) STORED | Concatenation of title + all text-type field values; used for full-text GIN index |
+| `tags` | `text[]` | NOT NULL, DEFAULT '{}' | Searchable tags (system field) |
+| `status` | `entry_status` | NOT NULL, DEFAULT 'draft' | |
+| `project_id` | `uuid` | NULLABLE, FK → `entries.id` | Denormalized from the `entry_reference` field with `entry_reference_type: project`; maintained by trigger |
+| `created_at` | `timestamptz` | NOT NULL, DEFAULT now() | |
+| `updated_at` | `timestamptz` | NOT NULL, DEFAULT now() | |
+| `deleted_at` | `timestamptz` | NULLABLE | Soft delete timestamp |
+
+**Notes on `search_text`:**
+The generated column concatenates `title` and the values of all fields with `field_type IN ('text', 'long_text', 'markdown')`. Because PostgreSQL generated columns cannot call user-defined functions directly, this concatenation is maintained by the `update_search_text` trigger instead of a true generated column. The column is functionally equivalent.
+
+**Indexes:**
+- `(user_id, type_slug)` — filtered list queries
+- `(user_id, status)` — status filtering
+- `(project_id)` — project workspace queries
+- `(tags)` — GIN index for array containment
+- GIN on `to_tsvector('english', search_text)` — full-text search
+
+**RLS:** Users can only access rows where `user_id = auth.uid()` and `deleted_at IS NULL`.
+
+---
+
 ### `entry_links`
 
-Explicit cross-links between entries. Supports the `related_entries` field and wiki-style `[[...]]` links resolved at save time.
+Explicit cross-links between entries, sourced from `entry_reference` fields and wiki-style `[[...]]` links.
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
 | `id` | `uuid` | PK, DEFAULT gen_random_uuid() | |
 | `source_entry_id` | `uuid` | NOT NULL, FK → `entries.id` ON DELETE CASCADE | |
 | `target_entry_id` | `uuid` | NOT NULL, FK → `entries.id` ON DELETE CASCADE | |
+| `link_type` | `text` | NOT NULL, DEFAULT 'wiki' | `wiki` (from `[[...]]`) or `field` (from `entry_reference` field) |
+| `field_key` | `text` | NULLABLE | Set for `link_type = 'field'`; the originating field key |
 | `created_at` | `timestamptz` | NOT NULL, DEFAULT now() | |
 
 **Constraints:**
-- UNIQUE `(source_entry_id, target_entry_id)`
+- UNIQUE `(source_entry_id, target_entry_id, field_key)` — allows one wiki link and one field link between the same pair
 - CHECK `source_entry_id <> target_entry_id`
 
 **RLS:** A user can only see/create links where both entries belong to them.
@@ -110,134 +193,106 @@ Explicit cross-links between entries. Supports the `related_entries` field and w
 
 ### `entry_embeddings`
 
-Stores the vector embedding for each entry. Separated from `entries` to keep the main table lean.
-
-The vector dimension is determined by the configured embedding model and is set at deployment time via the `EMBEDDING_DIMENSIONS` environment variable. The default model is `text-embedding-3-small` (1536 dimensions). Changing models requires a schema migration to update the column type and a full re-embedding of all entries.
+Stores the vector embedding for semantic search.
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
-| `entry_id` | `uuid` | PK, FK → `entries.id` ON DELETE CASCADE | One-to-one with entries |
-| `embedding` | `vector(EMBEDDING_DIMENSIONS)` | NOT NULL | pgvector embedding; dimension set at deploy time |
-| `model` | `text` | NOT NULL | Embedding model used (e.g. `text-embedding-3-small`) |
+| `entry_id` | `uuid` | PK, FK → `entries.id` ON DELETE CASCADE | |
+| `embedding` | `vector(EMBEDDING_DIMENSIONS)` | NOT NULL | Dimension set at deploy time via `EMBEDDING_DIMENSIONS` secret |
+| `model` | `text` | NOT NULL | Embedding model used |
 | `generated_at` | `timestamptz` | NOT NULL, DEFAULT now() | |
 
-**Indexes:**
-- IVFFlat index on `embedding vector_cosine_ops` for ANN search. Built after initial data load; not maintained in real-time (pgvector handles incremental updates).
+**Indexes:** IVFFlat on `embedding vector_cosine_ops`.
 
-**RLS:** Direct user access is blocked (`USING (false)`). Embeddings are read exclusively via the `match_entries` Postgres function (defined below) which uses `SECURITY DEFINER` and enforces user scoping internally.
+**RLS:** Blocked for direct access (`USING (false)`). Read exclusively via `match_entries` (`SECURITY DEFINER`).
 
 ---
 
 ### `api_tokens`
 
-Stores Personal API Tokens used to authenticate MCP tool calls from Claude.ai.
+Personal API Tokens for MCP authentication.
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
 | `id` | `uuid` | PK, DEFAULT gen_random_uuid() | |
-| `user_id` | `uuid` | NOT NULL, FK → `auth.users.id` ON DELETE CASCADE | Token owner |
-| `name` | `text` | NOT NULL | User-assigned label (e.g. "Claude.ai") |
-| `token_hash` | `text` | NOT NULL, UNIQUE | SHA-256 hash of the plaintext token |
-| `token_prefix` | `text` | NOT NULL | First 8 chars of the token for display (e.g. `sn_abc123`) |
-| `last_used_at` | `timestamptz` | NULLABLE | Updated on each successful use |
-| `revoked_at` | `timestamptz` | NULLABLE | Set when token is revoked |
+| `user_id` | `uuid` | NOT NULL, FK → `auth.users.id` ON DELETE CASCADE | |
+| `name` | `text` | NOT NULL | User-assigned label |
+| `token_hash` | `text` | NOT NULL, UNIQUE | SHA-256 of plaintext token |
+| `token_prefix` | `text` | NOT NULL | First 8 chars for display |
+| `last_used_at` | `timestamptz` | NULLABLE | |
+| `revoked_at` | `timestamptz` | NULLABLE | |
 | `created_at` | `timestamptz` | NOT NULL, DEFAULT now() | |
 
-**Constraints:**
-- CHECK: a user may not have more than 10 non-revoked tokens (enforced via trigger).
+**Constraints:** Max 10 active tokens per user (enforced via trigger).
 
-**RLS:** Users can only read and delete their own tokens. Insert is via a server-side function that generates the token, hashes it, and returns the plaintext once.
+**RLS:** Users read/delete their own tokens. Insert via `manage-tokens` Edge Function only.
 
 ---
 
 ### `embedding_queue`
 
-Tracks entries awaiting (re)embedding after creation or update. Enables async, retryable embedding generation.
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `id` | `uuid` | PK, DEFAULT gen_random_uuid() | |
+| `entry_id` | `uuid` | NOT NULL, UNIQUE, FK → `entries.id` ON DELETE CASCADE | |
+| `status` | `text` | NOT NULL, DEFAULT 'pending' | `pending` \| `processing` \| `done` \| `failed` |
+| `attempts` | `int` | NOT NULL, DEFAULT 0 | |
+| `last_error` | `text` | NULLABLE | |
+| `created_at` | `timestamptz` | NOT NULL, DEFAULT now() | |
+| `updated_at` | `timestamptz` | NOT NULL, DEFAULT now() | |
+
+**RLS:** Service role only.
+
+---
+
+### `invites`
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
 | `id` | `uuid` | PK, DEFAULT gen_random_uuid() | |
-| `entry_id` | `uuid` | NOT NULL, FK → `entries.id` ON DELETE CASCADE | |
-| `status` | `text` | NOT NULL, DEFAULT 'pending' | `pending` \| `processing` \| `done` \| `failed` |
-| `attempts` | `int` | NOT NULL, DEFAULT 0 | Retry counter |
-| `last_error` | `text` | NULLABLE | Last failure message |
+| `token_hash` | `text` | NOT NULL, UNIQUE | SHA-256 of the invite token |
+| `token_prefix` | `text` | NOT NULL | First 8 chars for display in admin UI |
+| `email` | `text` | NULLABLE | Optional pre-fill; does not restrict who can use the link |
+| `created_by` | `uuid` | NOT NULL, FK → `auth.users.id` | Superadmin who created it |
+| `used_by` | `uuid` | NULLABLE, FK → `auth.users.id` | Set on use |
+| `expires_at` | `timestamptz` | NULLABLE | |
+| `revoked_at` | `timestamptz` | NULLABLE | |
 | `created_at` | `timestamptz` | NOT NULL, DEFAULT now() | |
-| `updated_at` | `timestamptz` | NOT NULL, DEFAULT now() | |
+| `used_at` | `timestamptz` | NULLABLE | |
 
-**RLS:** Service role only (no user-facing access).
+**RLS:** Superadmins can read/write all rows. Unauthenticated users can validate a token hash (read-only, by hash only — no enumeration).
 
 ---
 
-## Metadata Schemas (per Entry Type)
+### `audit_log`
 
-These are enforced at the application layer. The `metadata` jsonb column stores type-specific fields beyond the base `entries` columns.
+Immutable event log for sensitive operations. Service role only — not user-readable via API.
 
-**Important:** `related_entries` is **not** stored in `metadata`. Links are stored exclusively in the `entry_links` table (see FR-024). When the API returns an entry, it populates `related_entries` dynamically from `entry_links` for convenience. On write, any `related_entries` values in incoming front-matter are resolved and written to `entry_links`, then removed from `metadata` before persistence.
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `id` | `uuid` | PK, DEFAULT gen_random_uuid() | |
+| `event_type` | `text` | NOT NULL | E.g. `pat_created`, `entry_hard_deleted`, `user_suspended` |
+| `actor_id` | `uuid` | NULLABLE | The user performing the action (nullable for system events) |
+| `target_id` | `uuid` | NULLABLE | The affected resource (user ID, entry ID, token ID, etc.) |
+| `metadata` | `jsonb` | NOT NULL, DEFAULT '{}' | Additional context (token_prefix, entry type, etc.) — no PII, no content |
+| `created_at` | `timestamptz` | NOT NULL, DEFAULT now() | |
 
-### `note`
-```jsonb
-{}
-```
-*(no type-specific metadata beyond base columns)*
-
-### `idea`
-```jsonb
-{}
-```
-
-### `article`
-```jsonb
-{
-  "source_url": "string",            // optional
-  "article_author": "string",        // optional
-  "published_date": "date"           // optional ISO 8601
-}
-```
-
-### `book`
-```jsonb
-{
-  "book_author": "string",           // required
-  "isbn": "string",                  // optional
-  "rating": 1,                       // optional, integer 1–5
-  "reading_status": "to-read"        // required: to-read | reading | completed
-}
-```
-
-### `project`
-```jsonb
-{}
-```
-
-### `meeting`
-```jsonb
-{
-  "meeting_date": "2026-01-15",      // required ISO 8601 date
-  "attendees": ["Alice", "Bob"]      // optional
-}
-```
+**RLS:** Superadmins can read. No user write access. Written exclusively by Edge Functions via service role.
 
 ---
 
 ## Database Functions
 
 ### `match_entries(query_embedding vector, match_count int, p_user_id uuid)`
-`SECURITY DEFINER` function used for semantic search. Bypasses RLS on `entry_embeddings` internally but enforces user scoping via the `p_user_id` parameter joined against `entries.user_id`. Returns ranked entries with cosine similarity scores.
+`SECURITY DEFINER` for semantic search. Enforces user scoping via join on `entries.user_id`.
 
 ```sql
--- Signature only; implementation in migration
 CREATE OR REPLACE FUNCTION match_entries(
   query_embedding vector,
   match_count     int,
   p_user_id       uuid
 )
-RETURNS TABLE (
-  id       uuid,
-  title    text,
-  body     text,
-  type     entry_type,
-  score    float
-)
+RETURNS TABLE (id uuid, title text, metadata jsonb, type_slug text, score float)
 LANGUAGE plpgsql SECURITY DEFINER;
 ```
 
@@ -245,29 +300,24 @@ LANGUAGE plpgsql SECURITY DEFINER;
 
 ## Database Triggers
 
-### `handle_new_user`
-On `INSERT INTO auth.users` → creates a corresponding row in `profiles`.
-
-### `set_updated_at`
-On `UPDATE` of `entries`, `profiles`, `embedding_queue` → sets `updated_at = now()`.
-
-### `queue_embedding_on_change`
-On `INSERT OR UPDATE` of `entries` (when `title` or `body` changes) → upserts a row in `embedding_queue` with `status = 'pending'`.
-
-### `enforce_token_limit`
-On `INSERT INTO api_tokens` → raises an exception if the user already has 10 non-revoked tokens.
+| Trigger | On | Action |
+|---------|-----|--------|
+| `handle_new_user` | INSERT `auth.users` | Creates `profiles` row |
+| `set_updated_at` | UPDATE `entries`, `profiles`, `entry_type_definitions`, `embedding_queue` | Sets `updated_at = now()` |
+| `queue_embedding_on_change` | INSERT OR UPDATE `entries` (title or metadata changed) | Upserts `embedding_queue` row with `status='pending'` |
+| `sync_project_id` | INSERT OR UPDATE `entries` | Copies `entry_reference` field value with `entry_reference_type='project'` into denormalized `project_id` |
+| `update_search_text` | INSERT OR UPDATE `entries` | Rebuilds `search_text` from title + all text-type field values via type schema lookup |
+| `enforce_token_limit` | INSERT `api_tokens` | Raises exception if user has ≥ 10 active tokens |
+| `prevent_field_type_change` | UPDATE `field_definitions` | Raises exception if `field_type` changes and any entry uses that field |
+| `increment_schema_version` | INSERT OR UPDATE OR DELETE `field_definitions` | Increments `entry_type_definitions.schema_version` |
 
 ---
 
 ## Embedding Queue Worker
 
-The `embedding_queue` table is processed by a **Supabase Edge Function** (`process-embedding-queue`) triggered on a cron schedule (every 60 seconds via `pg_cron`). The function:
-
-1. Claims up to 10 `pending` rows (sets `status = 'processing'`).
-2. Fetches each entry's `title || '\n\n' || body` text.
-3. Calls the configured embedding provider API.
-4. Upserts the result into `entry_embeddings`.
-5. Sets the queue row to `done` or `failed` (with `last_error`).
-6. Retries up to 3 times before marking `failed` permanently.
-
-This design ensures entry saves are never blocked by embedding latency and embedding generation is retryable without data loss.
+`process-embedding-queue` Edge Function runs on a `pg_cron` schedule (every 60 seconds):
+1. Claims ≤ 10 `pending` rows atomically.
+2. For each entry, concatenates `title + '\n\n' + search_text` for embedding input.
+3. Calls the configured provider (`EMBEDDING_PROVIDER` secret).
+4. Upserts into `entry_embeddings`.
+5. Sets status to `done` or `failed`; retries up to 3 times before permanent failure.

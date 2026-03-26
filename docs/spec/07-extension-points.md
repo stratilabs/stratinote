@@ -1,79 +1,52 @@
 # Extension Points
 
-This document describes the designed extension points of Stratinote. The goal is that common additions — new entry types, new Claude skills, new embedding models — require no changes to core logic, only the addition of new configuration or module files.
+This document describes the designed extension points of Stratinote. The goal is that common additions — new entry types, new MCP tools, new embedding models — require no code deployment for UI-driven operations, and minimal scoped changes for code-level extensions.
 
 ---
 
 ## 1. Adding a New Entry Type
 
-### Step 1 — Define the template
+### Option A — Via the Web UI (no code required)
 
-Create a new Markdown template file at:
-```
-src/templates/<new-type>.md
-```
+Users add their own types through the web UI:
+1. Navigate to Settings → My Entry Types → New Type.
+2. Set name, slug, description, icon, colour, and layer.
+3. Add field definitions using the field builder.
+4. Save. The type is immediately available for entry creation and in the MCP integration.
 
-The file must contain a YAML front-matter block with at minimum:
-```yaml
----
-type: <new-type>
-title: ""
-tags: []
-status: draft
-created_at: ""
-updated_at: ""
-author_id: ""
-related_entries: []
----
-```
+Superadmins add system types (available to all users) via Admin → Entry Types → New System Type. Same flow, no code deployment needed.
 
-Add any type-specific fields to the front-matter.
+### Option B — Via Supabase migration (for programmatic seeding)
 
-### Step 2 — Register the type in the schema
+For bootstrapping or bulk system type creation:
 
-Add the new type to the `entry_type` enum in a new Supabase migration:
 ```sql
-ALTER TYPE entry_type ADD VALUE '<new-type>';
+-- 1. Insert the type definition
+INSERT INTO entry_type_definitions (slug, name, owner_type, layer)
+VALUES ('research-note', 'Research Note', 'system', 'knowledge_base');
+
+-- 2. Insert field definitions
+INSERT INTO field_definitions (type_definition_id, field_key, label, field_type, display_group, "order", required)
+SELECT id, 'hypothesis', 'Hypothesis', 'markdown', 'document', 1, true
+FROM entry_type_definitions WHERE slug = 'research-note';
 ```
 
-### Step 3 — Define the metadata schema
-
-Add a metadata validation schema to the `mcp-server` Edge Function:
-```
-supabase/functions/mcp-server/schemas/<new-type>.ts
-```
-
-Export a Zod schema:
-```ts
-export const newTypeMetadataSchema = z.object({
-  // your type-specific fields
-});
-```
-
-Register it in `supabase/functions/mcp-server/schemas/index.ts`:
-```ts
-export const metadataSchemas: Record<EntryType, ZodSchema> = {
-  // ...existing
-  'new-type': newTypeMetadataSchema,
-};
-```
-
-### Step 4 — (Optional) Add an MCP tool
-
-See §3 below to add a new MCP tool for the type (e.g. a specialised creation flow).
-
-### No other changes required.
-
-PostgREST handles CRUD generically. The `search`, `export`, and `import` Edge Functions handle all types without modification.
+No application code changes are needed. The MCP `get_type_schema` tool, the structured editor, search, and export all handle new types generically.
 
 ---
 
-## 2. Adding a New Metadata Field to an Existing Type
+## 2. Adding a New Field to an Existing Type
 
-1. Update the template row in the `templates` table via a Supabase migration.
-2. Update the Zod schema for the type in the `mcp-server` Edge Function (add new field as `.optional()` for backward compatibility).
-3. Create a Supabase migration if a new index is needed for the field.
-4. Add a test case to the Edge Function unit tests.
+**Via UI:** Settings → My Entry Types → [Type] → Add Field. Choose type, label, display group, and order. New fields are always optional for existing entries.
+
+**Via migration (system types):**
+```sql
+INSERT INTO field_definitions (type_definition_id, field_key, label, field_type, display_group, "order", required)
+SELECT id, 'new_field', 'New Field', 'text', 'properties', 10, false
+FROM entry_type_definitions WHERE slug = 'note';
+```
+
+Adding a required field to a type that already has entries: the field is treated as optional for existing entries (those entries have `schema_version` < current). Only new entries must supply it.
 
 ---
 

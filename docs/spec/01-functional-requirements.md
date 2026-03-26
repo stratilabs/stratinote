@@ -6,87 +6,83 @@ Each requirement is identified by a unique ID (`FR-XXX`) for traceability. Each 
 
 ## 1. Entry Management
 
-### FR-001 — Entry Types
+### FR-001 — Dynamic Entry Type System
 **Priority:** P1
 
-The system shall support the following built-in entry types, each with its own Markdown template:
+Entry types are not hardcoded. Every type is defined by an **Entry Type Definition**: a named schema consisting of typed field definitions. Users see only types available to them (system types + their own types).
 
-| Type | Layer | Purpose |
-|------|-------|---------|
-| `note` | Knowledge Base | Free-form permanent note |
-| `idea` | Knowledge Base | Captured idea or hypothesis |
-| `article` | Knowledge Base | Summary/annotation of an external article |
-| `book` | Knowledge Base | Book summary with key insights |
-| `project` | Project Workspace | Project brief and context container |
-| `meeting` | Project Workspace | Meeting minutes linked to a project |
+**Tier model:**
+
+| Tier | Defined by | Available to | Mutable by |
+|------|-----------|-------------|-----------|
+| **System** | Superadmin | All users | Superadmin only |
+| **User** | Individual user | That user only | That user |
+| **Fork** | Individual user | That user only | That user (derived from a system type) |
+
+**Built-in system types** (pre-seeded, equivalent to the previous hardcoded set):
+
+| Type slug | Name | Layer |
+|-----------|------|-------|
+| `note` | Note | knowledge_base |
+| `idea` | Idea | knowledge_base |
+| `article` | Article | knowledge_base |
+| `book` | Book Review | knowledge_base |
+| `project` | Project | project_workspace |
+| `meeting` | Meeting | project_workspace |
 
 **Acceptance Criteria:**
-- Each entry type has a corresponding Markdown template with a YAML front-matter block.
-- Creating an entry without a valid type is rejected with a descriptive error.
-- The list of supported types is retrievable via API.
+- The type a user selects when creating an entry can be any system type or any type they own.
+- Retrieving the list of available types returns system types + the requesting user's own types.
+- Creating an entry against a deleted or another user's type is rejected.
+- Entry type cannot be changed after creation.
 
 ---
 
-### FR-002 — Markdown Templates with Metadata
+### FR-002 — Field Type System
 **Priority:** P1
 
-Each entry type shall have a standardised Markdown template containing:
-- A YAML front-matter block with type-specific required and optional fields.
-- Section headings appropriate to the entry type.
-- Inline guidance comments that are removed before storing.
+Each Entry Type Definition contains an ordered list of **Field Definitions**. Every field has a type from the supported set below.
+
+**Supported field types:**
+
+| Field type | Storage | Description | Example use |
+|-----------|---------|-------------|-------------|
+| `text` | string | Single-line text | Author name, ISBN |
+| `long_text` | string | Multi-line plain text | Short description |
+| `markdown` | string | Full Markdown content block | Key insights, action items |
+| `date` | ISO 8601 date | Date picker | Meeting date, published date |
+| `datetime` | ISO 8601 datetime | Date + time picker | Event timestamp |
+| `number` | number | Numeric value | Rating (1–5), page count |
+| `url` | string | URL with format validation | Source link |
+| `select` | string | Single choice from predefined options | Reading status |
+| `multi_select` | string[] | Multiple choices from options | Categories |
+| `boolean` | boolean | Yes/no toggle | Reviewed, archived |
+| `entry_reference` | uuid | FK to another entry | Project link (for meetings) |
+
+**System fields** are always present on every entry regardless of type and are **not** part of the field definition schema:
+- `title` (text, required, always first)
+- `tags` (multi_select, optional)
+- `status` (select: draft/active/archived/deleted)
+- `created_at`, `updated_at`, `owner` (auto-populated)
+
+**Field Definition properties:**
+- `field_key` — unique slug within the type (immutable after creation)
+- `label` — display name shown in editor and Claude conversations
+- `field_type` — one of the supported types above
+- `required` — boolean; enforced at save time
+- `default_value` — optional; used to pre-populate the editor
+- `options` — for `select` / `multi_select`: ordered list of `{value, label}` pairs
+- `hint` — optional helper text shown in the editor beneath the field
+- `entry_reference_type` — for `entry_reference`: constrains the target to a specific type slug (e.g. `project`)
+- `display_group` — `properties` (rendered in the properties strip) or `document` (rendered as a document section). `markdown` and `long_text` fields default to `document`; all others default to `properties`
+- `order` — display position within its `display_group`
 
 **Acceptance Criteria:**
-- Templates are retrievable by entry type via API.
-- Stored entries must pass front-matter schema validation for their type.
-- Missing required metadata fields cause a validation error before storage.
-
-**Example — `note` template front-matter:**
-```yaml
----
-type: note
-title: ""
-tags: []
-status: draft          # draft | active | archived
-created_at: ""         # auto-filled
-updated_at: ""         # auto-filled
-author_id: ""          # auto-filled
-related_entries: []    # list of entry IDs
----
-```
-
-**Example — `book` template front-matter:**
-```yaml
----
-type: book
-title: ""
-author: ""
-isbn: ""
-tags: []
-status: reading        # to-read | reading | completed
-rating: null           # 1–5
-created_at: ""
-updated_at: ""
-author_id: ""
-related_entries: []
----
-```
-
-**Example — `meeting` template front-matter:**
-```yaml
----
-type: meeting
-title: ""
-project_id: ""         # required — links to a project entry
-date: ""
-attendees: []
-tags: []
-status: draft
-created_at: ""
-updated_at: ""
-author_id: ""
-related_entries: []
----
-```
+- A type definition with no fields (beyond system fields) is valid.
+- Field keys must be unique within a type and match `^[a-z][a-z0-9_]*$`.
+- A `select` or `multi_select` field with no options is rejected.
+- `entry_reference` fields with an `entry_reference_type` that does not match any known type slug are rejected.
+- Field type cannot be changed after a field is created (to protect existing entry data).
 
 ---
 
@@ -97,8 +93,9 @@ The system shall support Create, Read, Update, and Delete operations for all ent
 
 **Acceptance Criteria:**
 - Create: a new entry is persisted with a unique ID, timestamps, and the requesting user's ID.
-- Read: entries are retrievable by ID; only entries owned by (or shared with) the requesting user are returned.
-- Update: the `updated_at` timestamp is refreshed on every update; entry type cannot be changed after creation.
+- Read: entries are retrievable by ID; only entries owned by the requesting user are returned.
+- Update: the `updated_at` timestamp is refreshed on every update; entry type and field keys cannot be changed after creation.
+- All field values in `metadata` are validated against the type's field definitions at write time; missing required fields cause a validation error.
 - Delete: soft-delete by default (status set to `deleted`); hard-delete available as a separate explicit action.
 - All operations enforce RLS (see Security Specification).
 
@@ -107,25 +104,57 @@ The system shall support Create, Read, Update, and Delete operations for all ent
 ### FR-004 — Entry Cross-Linking
 **Priority:** P2
 
-Entries shall support explicit links to other entries via the `related_entries` front-matter field and inline wiki-style links (`[[entry-id]]` or `[[entry-title]]`).
+Entries shall support explicit links to other entries via `entry_reference` fields and inline wiki-style links (`[[entry-title]]`) in `markdown` fields.
 
 **Acceptance Criteria:**
-- The system resolves `[[entry-title]]` links to the correct entry ID on save.
-- Broken links (pointing to deleted or non-existent entries) are flagged as warnings, not errors.
+- `entry_reference` field values are validated as existing entry IDs owned by the user.
+- `[[entry-title]]` links in Markdown fields are resolved to entry IDs on save and stored in `entry_links`.
+- Broken links are flagged as warnings, not errors.
 - An entry's inbound links (backlinks) are queryable via API.
-- Wiki-style links render as clickable hyperlinks in the web UI.
+- Wiki-style links render as clickable hyperlinks in the web UI editor.
 
 ---
 
 ### FR-005 — Project Workspace
 **Priority:** P1
 
-A `project` entry acts as a container. `meeting` entries and other project-scoped entries must reference a valid `project_id`.
+Project-scoped entries (type layer = `project_workspace`) must include an `entry_reference` field targeting a `project` type entry. This replaces the hardcoded `project_id` column.
 
 **Acceptance Criteria:**
-- Creating a `meeting` entry without a valid `project_id` is rejected.
-- All entries belonging to a project are listable via API filtered by `project_id`.
-- Deleting a project soft-deletes the project entry; associated entries remain but lose their project reference warning.
+- System type `meeting` has a required `entry_reference` field `project_id` with `entry_reference_type: project`.
+- User-defined types with layer `project_workspace` must include at least one required `entry_reference` field.
+- Creating a project-workspace entry without a valid project reference is rejected.
+- All entries belonging to a project are listable via API filtered by `project_id` (resolved from the `entry_reference` field value).
+
+---
+
+### FR-025 — Entry Type Definition CRUD (User Types)
+**Priority:** P1
+
+Users shall be able to create, read, update, and delete their own entry type definitions via the web UI.
+
+**Acceptance Criteria:**
+- A user can create a new type definition with a name, optional description, icon, and ordered list of field definitions.
+- A user can reorder, add, or update fields in their own types.
+- A user cannot delete a field that has data in any existing entry (they may mark it deprecated instead; deprecated fields are hidden in the editor but their data is preserved).
+- A user cannot delete a type that has existing non-deleted entries; they must archive it first.
+- Changes to a type definition increment its `schema_version`; existing entries retain their original `schema_version` and remain valid.
+- Retrieving a type definition includes the `schema_version` and a `field_count`.
+
+---
+
+### FR-026 — Type Forking
+**Priority:** P2
+
+Users shall be able to fork a system entry type to create a personalised variant.
+
+**Acceptance Criteria:**
+- Forking creates a new user-owned type pre-populated with the system type's field definitions.
+- The fork is independent; subsequent changes to the system type do not propagate to the fork.
+- The fork records `forked_from` (the source system type slug) for informational purposes.
+- The user can add, remove, or reorder fields on the forked type freely.
+
+---
 
 ---
 
@@ -142,8 +171,9 @@ The system shall implement a Stratinote MCP server that registers the following 
 
 | Tool | Purpose |
 |------|---------|
-| `get_template` | Returns the Markdown template for a given entry type |
-| `create_entry` | Persists a completed, user-approved entry |
+| `list_entry_types` | Lists all entry types available to the user (system + own) |
+| `get_type_schema` | Returns the field definitions for a given type slug or ID |
+| `create_entry` | Persists a new entry as structured field values |
 | `update_entry` | Updates an existing entry by ID |
 | `search_knowledge_base` | Semantic search over the user's knowledge base |
 | `get_entry` | Retrieves a single entry by ID or title |
@@ -152,9 +182,11 @@ The system shall implement a Stratinote MCP server that registers the following 
 **Acceptance Criteria:**
 - The MCP server implements the MCP protocol spec and is registerable in Claude.ai as a remote integration.
 - Each tool has a clear name, description, and typed input schema so Claude can invoke it correctly without user guidance.
+- `get_type_schema` returns an ordered list of field definitions (key, label, type, required, options, hint) — not a Markdown template.
+- `create_entry` accepts a structured map of `{ field_key: value }` pairs, validated server-side against the type schema.
 - All tool calls are authenticated via the Personal API Token in the request header (see FR-022).
 - A tool call with an invalid or expired token returns a structured MCP error; Claude surfaces this to the user.
-- The MCP server is a standalone deployable service (or Next.js API route group) separate from the web-facing REST API.
+- The MCP server is a Supabase Edge Function.
 
 ---
 
@@ -165,12 +197,12 @@ The Claude.ai integration shall enable the user to create a new entry through na
 
 **Flow:**
 1. User asks Claude to capture a new note, book summary, idea, etc.
-2. Claude calls `get_template` for the appropriate entry type.
-3. Claude guides the user conversationally to provide the required content.
-4. Claude assembles the final Markdown with front-matter and presents it to the user for review.
+2. Claude calls `list_entry_types` to confirm available types, then `get_type_schema` for the chosen type.
+3. Claude guides the user conversationally, asking for each required field by its `label`.
+4. Claude summarises the collected values and presents them to the user for review.
 5. User approves (or asks for changes and iterates).
-6. Claude calls `create_entry` with the final Markdown.
-7. Claude confirms with the entry ID and a link to the web UI entry page.
+6. Claude calls `create_entry` with the structured `{ field_key: value }` map.
+7. Claude confirms with the entry ID and a direct link to the web UI entry page.
 
 **Acceptance Criteria:**
 - The user never needs to write YAML front-matter manually; Claude fills it from the conversation.
@@ -249,28 +281,59 @@ The web UI shall provide a search interface supporting both full-text and semant
 
 ---
 
-### FR-012 — Markdown Entry Editor
+### FR-012 — Structured Document Editor
 **Priority:** P1
 
-The web UI shall provide an inline Markdown editor for viewing and editing entries.
+The web UI shall provide a unified document editor where the entry type's field structure is seamlessly embedded into the writing surface. The user writes naturally without switching between form and document views.
+
+**Layout:**
+
+```
+┌─────────────────────────────────────────────────────┐
+│  [Title — H1, always first, always editable]        │
+├─────────────────────────────────────────────────────┤
+│  Properties strip (collapsible):                    │
+│  Author [__________]  Rating [★★★★☆]               │
+│  Status [completed ▾] Date   [2026-01-15]           │
+├─────────────────────────────────────────────────────┤
+│  Key Insights          ← non-editable section label │
+│  ┌─────────────────────────────────────────────┐    │
+│  │ This book argues that...                    │    │
+│  │                                             │    │
+│  └─────────────────────────────────────────────┘    │
+│                                                     │
+│  Action Items          ← non-editable section label │
+│  ┌─────────────────────────────────────────────┐    │
+│  │ - Apply slow thinking to ...                │    │
+│  └─────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────┘
+```
+
+**Editor implementation:** [Tiptap](https://tiptap.dev/) (ProseMirror-based). The document schema is derived from the entry type's field definitions at load time. Document-group fields become Tiptap node types with fixed, non-deletable section headings.
 
 **Acceptance Criteria:**
-- Editor supports Markdown syntax highlighting.
-- Front-matter metadata is editable via a structured form (not raw YAML).
-- Saving triggers re-embedding of the entry.
-- Unsaved changes prompt the user before navigation.
-- Wiki-style links `[[...]]` render as clickable links.
+- `document`-group fields (`markdown`, `long_text`) render as labelled sections in document flow order.
+- Section label headings are visible and styled as H2 but are not editable or deletable by the user.
+- The cursor moves naturally between sections (Tab / arrow keys cross section boundaries).
+- `properties`-group fields render in a collapsible strip above the document body.
+- Each property field renders its appropriate interactive widget inline (date picker, star rating, select dropdown, URL input, entry reference picker).
+- Markdown syntax shortcuts work inside `markdown` fields (e.g. `**bold**`, `- list item`, `## heading`).
+- Wiki-style links `[[entry title]]` in markdown fields are rendered as clickable chips with the linked entry's title; unresolved links render as plain text with a warning indicator.
+- Saving re-queues the entry for embedding.
+- Unsaved changes trigger a confirmation prompt before navigation.
+- The editor is read-only for entries belonging to other users (future sharing feature) and for system entry type definitions.
 
 ---
 
 ### FR-013 — Entry Creation via Web UI
 **Priority:** P2
 
-The web UI shall allow creating new entries directly, as an alternative to the Claude skill flow.
+The web UI shall allow creating new entries directly, as an alternative to the Claude MCP flow.
 
 **Acceptance Criteria:**
-- User selects entry type, and the template is pre-populated.
-- Validation errors are shown inline before save.
+- User selects an available entry type from a picker (system types shown first, then user types).
+- The structured document editor opens with default values pre-populated and focus on the title field.
+- Validation errors are shown inline (required fields highlighted) before the entry can be saved.
 - After creation, the user is redirected to the new entry's page.
 
 ---
@@ -423,3 +486,81 @@ Entry cross-links are stored exclusively in the `entry_links` table. The `relate
 - On entry read, the API populates `related_entries` in the response by querying `entry_links`, so consumers always see a consistent view.
 - Wiki-style `[[title]]` links found in the entry body are resolved and added to `entry_links` at save time.
 - Unresolvable `[[title]]` references are preserved as-is in the body and flagged as warnings; no `entry_link` row is created for them.
+
+---
+
+## 9. Superadmin
+
+A **superadmin** is a privileged user with access to the `/admin` section of the web UI. Superadmin status is set via the `is_superadmin` flag on the `profiles` table, enforced at both the API/Edge Function layer and by RLS.
+
+### FR-027 — Superadmin User Management
+**Priority:** P1
+
+The superadmin shall have a user management interface for governing all registered users.
+
+**Acceptance Criteria:**
+- List all users with columns: email, display name, entry count, type definition count, last active, account status (active/suspended).
+- Suspend or unsuspend a user account. Suspended users cannot authenticate; their data is preserved.
+- View a user's entry type definitions (names and field counts only — no entry content, for privacy).
+- Trigger permanent account deletion. This fires the data deletion cascade (entries, embeddings, tokens, profile).
+- All superadmin actions are written to the `audit_log` table.
+
+---
+
+### FR-028 — Invite System
+**Priority:** P1
+
+The system shall support an invite-based registration mode controlled by the superadmin.
+
+**Registration mode** is set via the `REGISTRATION_MODE` environment variable:
+- `open` — anyone can register.
+- `invite_only` — registration requires a valid invite token.
+
+**Acceptance Criteria:**
+- Superadmin can generate single-use invite links with an optional expiry date and optional email pre-fill.
+- Invite links are listed in the admin UI with status: pending / used / expired / revoked.
+- Superadmin can revoke a pending invite; revoked invites are immediately invalid.
+- When `REGISTRATION_MODE=invite_only`, registration without a valid invite token returns an error.
+- When `REGISTRATION_MODE=open`, the invite system remains available for superadmin use but is not enforced.
+- Each invite is single-use: once a user completes registration with it, the invite is marked used and cannot be reused.
+- Invite tokens are stored as opaque hashes; the plaintext URL is generated at creation time only.
+
+---
+
+### FR-029 — Superadmin System Type Management
+**Priority:** P1
+
+The superadmin shall be able to create, update, and deprecate system entry type definitions, which are available to all users.
+
+**Acceptance Criteria:**
+- Superadmin can create new system types with any field schema.
+- Superadmin can add new optional fields to existing system types (backward-compatible; increments `schema_version`).
+- Superadmin cannot remove a field from a system type that has existing entry data; they may mark the field deprecated (hidden in editor, data preserved).
+- Superadmin can mark a system type as deprecated: it remains usable for existing entries but is hidden from the creation picker.
+- Superadmin cannot delete a system type that has existing entries across any user.
+- Changes to system types do not affect user forks of those types.
+
+---
+
+### FR-030 — Health Dashboard
+**Priority:** P2
+
+The superadmin shall have a dashboard showing system health and usage metrics.
+
+**Metrics displayed:**
+
+| Metric | Source |
+|--------|--------|
+| Total registered users | `auth.users` count |
+| Active users (last 7 days / 30 days) | `profiles.last_active_at` |
+| Total entries (by type, by status) | `entries` count |
+| Embedding queue depth | `embedding_queue` pending count |
+| Embedding failure rate (last 24h) | `embedding_queue` failed count |
+| Total system types / user-defined types | `entry_type_definitions` counts |
+| Storage used | Supabase Storage API |
+| Edge Function error rate | Supabase logs API |
+
+**Acceptance Criteria:**
+- Dashboard refreshes on page load; no real-time streaming required.
+- All metrics are scoped to the production project and visible only to superadmins.
+- A "re-queue failed embeddings" action allows superadmin to reset all `failed` queue items to `pending`.

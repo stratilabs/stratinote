@@ -75,8 +75,16 @@ When OAuth providers (Google, GitHub) are enabled:
 
 ## 3. Authorisation and Row Level Security
 
-### SEC-007 — RLS on All User Tables
-RLS is **enabled** on `entries`, `entry_links`, `entry_embeddings`, and `profiles`. Every policy references `auth.uid()`.
+### SEC-007 — Superadmin Role
+Superadmin status is stored in `profiles.is_superadmin`. This flag:
+- Can only be set via a direct database migration or a CLI script run by an operator — never via any API endpoint.
+- Is checked in every Edge Function that handles admin operations by reading the `profiles` row for the authenticated user.
+- Is additionally enforced by RLS policies on `entry_type_definitions` (system types), `invites`, and `audit_log`.
+
+The JWT for a superadmin session is indistinguishable from a regular user JWT; the superadmin check is always a database read, never a claim in the token.
+
+### SEC-007a — RLS on All User Tables
+RLS is **enabled** on `entries`, `entry_links`, `entry_embeddings`, `entry_type_definitions`, `field_definitions`, `api_tokens`, `profiles`, `invites`, and `audit_log`. Every policy references `auth.uid()`.
 
 **`entries` RLS policies:**
 ```sql

@@ -70,6 +70,9 @@ Edge Functions shall emit structured JSON logs for all requests and errors, incl
 
 ## 5. Usability
 
+### NFR-015a — Structured Editor Responsiveness
+The structured document editor shall render and become interactive within **1 second** of the entry page loading, for entries with up to 20 fields and 50,000 characters of total content. Typing in any field shall have less than **50ms** input latency (no perceptible lag).
+
 ### NFR-016 — Mobile Compatibility
 The web UI shall be responsive and usable on mobile screens (≥ 375px width).
 

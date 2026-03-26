@@ -27,22 +27,43 @@
 
 ## 2. Unit Tests
 
-### T-U001 — Entry Type Validation (FR-001, FR-002)
+### T-U001 — Field Definition Validation (FR-002)
 ```
-GIVEN an entry creation payload
-WHEN the `type` field is missing or invalid
-THEN a VALIDATION_ERROR is returned with field details
-```
-
-### T-U002 — Metadata Schema Validation per Type (FR-002)
-```
-GIVEN a `book` entry payload
-WHEN `metadata.book_author` is missing
+GIVEN a field definition with field_type 'select' and no options
 THEN a VALIDATION_ERROR is returned
 
-GIVEN a `meeting` entry payload
-WHEN `project_id` is null
+GIVEN a field_key of "My Field" (contains uppercase and space)
+THEN a VALIDATION_ERROR is returned (must match ^[a-z][a-z0-9_]*$)
+
+GIVEN a valid field definition with field_type 'entry_reference' and entry_reference_type 'project'
+THEN the field is created successfully
+
+GIVEN an existing field used in 3 entries
+WHEN the field_type is changed from 'text' to 'markdown'
+THEN a VALIDATION_ERROR is returned (field_type immutable when data exists)
+```
+
+### T-U001b — Entry Metadata Validation (FR-001, FR-002, FR-003)
+```
+GIVEN an entry creation payload missing type_definition_id
 THEN a VALIDATION_ERROR is returned
+
+GIVEN a 'book' type entry missing the required 'book_author' field in metadata
+THEN a VALIDATION_ERROR is returned referencing the field label
+
+GIVEN a 'book' type entry with all required fields
+THEN the entry is created and search_text includes all text-type field values
+```
+
+### T-U002 — Schema Version Backward Compatibility (FR-025)
+```
+GIVEN a type schema at version 3 (a new required field added in v3)
+AND an existing entry written at schema_version 2 (missing that field)
+WHEN the entry is read
+THEN no validation error is raised (older schema versions are valid for their version)
+
+WHEN the entry is updated
+THEN the new required field is enforced (update targets current schema version)
 ```
 
 ### T-U003 — Wiki-Link Resolution (FR-004)
@@ -190,6 +211,63 @@ AND the ZIP contains 3 .md files in folders named by type
 AND each file contains valid front-matter
 ```
 
+### T-I010c — User-Defined Entry Type Lifecycle (FR-025)
+```
+GIVEN an authenticated user
+WHEN they create a type definition with 2 fields (one required)
+THEN the type appears in their type list and in the MCP list_entry_types response
+
+WHEN they create an entry using the new type with the required field populated
+THEN the entry is persisted
+
+WHEN they try to delete the type while it has entries
+THEN a VALIDATION_ERROR is returned
+
+WHEN they deprecate a field that has data
+THEN existing entries are unaffected
+AND the deprecated field is hidden from the editor
+
+WHEN they try to change a field_type that has data
+THEN a VALIDATION_ERROR is returned
+```
+
+### T-I010d — Type Forking (FR-026)
+```
+GIVEN the system type 'book'
+WHEN a user forks it
+THEN a new user-owned type is created with the same fields
+AND forked_from_slug = 'book'
+WHEN the superadmin later updates the system 'book' type
+THEN the user's fork is unchanged
+```
+
+### T-I010e — Invite System (FR-028)
+```
+GIVEN REGISTRATION_MODE=invite_only
+WHEN an unauthenticated user attempts to register without an invite token
+THEN HTTP 422 is returned
+
+GIVEN a superadmin creates an invite with no expiry
+WHEN the invite token is used to register a new user
+THEN the user is created AND invite.used_at is set AND invite cannot be reused
+
+GIVEN a pending invite
+WHEN the superadmin revokes it
+THEN the token is immediately invalid for registration
+```
+
+### T-I010f — Superadmin User Management (FR-027)
+```
+GIVEN a superadmin authenticated user
+WHEN they call admin Edge Function action=suspend_user
+THEN the target user's suspended_at is set
+AND the suspended user cannot authenticate
+
+GIVEN a regular user
+WHEN they call admin Edge Function action=list_users
+THEN HTTP 403 is returned
+```
+
 ### T-I010a — PAT Create, Use, and Revoke (FR-022, FR-023)
 ```
 GIVEN an authenticated user (Supabase JWT)
@@ -249,6 +327,27 @@ THEN they are redirected to the main dashboard
 
 WHEN the user logs out and logs back in
 THEN they see their dashboard with existing entries
+```
+
+### T-E001b — Structured Document Editor (FR-012)
+```
+GIVEN an existing 'book' entry
+WHEN the user opens it in the editor
+THEN the title is rendered as an H1 at the top
+AND scalar fields (author, rating, status) appear in the collapsible properties strip
+AND markdown fields (Key Insights, Action Items) appear as labelled sections in document order
+AND section labels are not editable or deletable
+
+WHEN the user clicks into the Key Insights section and types
+THEN the content is accepted as markdown
+AND Tab key moves focus to the next section
+
+WHEN the user types [[Another Entry Title]] in a markdown section
+THEN the link resolves to a clickable chip if the entry exists
+AND an unresolved warning indicator appears if it does not
+
+WHEN the user modifies content and attempts to navigate away without saving
+THEN a confirmation dialog is shown
 ```
 
 ### T-E002 — Create Entry via Web UI (FR-013)

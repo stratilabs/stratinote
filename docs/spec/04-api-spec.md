@@ -18,18 +18,20 @@ RLS policies enforce ownership on every call. No custom routing needed.
 
 ### List entries
 ```
-GET /rest/v1/entries?select=id,type,title,tags,status,project_id,created_at,updated_at
+GET /rest/v1/entries
+  ?select=id,type_slug,title,tags,status,project_id,created_at,updated_at
   &deleted_at=is.null
   &order=updated_at.desc
   &limit=20
   &offset=0
 ```
-Add filters: `&type=eq.note`, `&tags=cs.{ai,notes}`, `&project_id=eq.<uuid>`
+Add filters: `&type_slug=eq.book`, `&tags=cs.{ai,notes}`, `&project_id=eq.<uuid>`
 
 ### Get single entry (with related data)
 ```
 GET /rest/v1/entries?id=eq.<uuid>
-  &select=*,entry_links!source_entry_id(target_entry_id)
+  &select=*,entry_links!source_entry_id(target_entry_id,field_key,link_type),
+          entry_type_definitions!type_definition_id(slug,name,field_definitions(*))
 ```
 
 ### Create entry
@@ -38,8 +40,21 @@ POST /rest/v1/entries
 Content-Type: application/json
 Prefer: return=representation
 
-{ "type": "note", "title": "...", "body": "...", "tags": [], "status": "draft", "metadata": {} }
+{
+  "type_definition_id": "uuid",
+  "type_slug": "book",
+  "schema_version": 3,
+  "title": "Thinking, Fast and Slow",
+  "tags": ["psychology"],
+  "status": "draft",
+  "metadata": {
+    "book_author": "Daniel Kahneman",
+    "reading_status": "completed",
+    "summary": "## Key Insight\nTwo systems..."
+  }
+}
 ```
+Field values in `metadata` are validated by the `validate_entry_metadata` Edge Function before the PostgREST insert completes (invoked via a Postgres function wrapper).
 
 ### Update entry
 ```
@@ -47,9 +62,9 @@ PATCH /rest/v1/entries?id=eq.<uuid>
 Content-Type: application/json
 Prefer: return=representation
 
-{ "title": "...", "body": "...", "updated_at": "now()" }
+{ "title": "...", "metadata": { "summary": "Updated..." } }
 ```
-> `type` is immutable; include it in the `PATCH` body and the DB will reject a change via a trigger.
+> `type_definition_id` is immutable after creation (enforced by trigger).
 
 ### Soft-delete entry
 ```
@@ -63,29 +78,65 @@ Hard delete requires the `hard-delete` Edge Function (see §2) to cascade cleanl
 ### Backlinks
 ```
 GET /rest/v1/entry_links?target_entry_id=eq.<uuid>
-  &select=source_entry_id,entries!source_entry_id(id,title,type)
+  &select=source_entry_id,entries!source_entry_id(id,title,type_slug)
 ```
 
-### Create entry link
+### Entry type definitions (user-facing)
 ```
-POST /rest/v1/entry_links
-{ "source_entry_id": "<uuid>", "target_entry_id": "<uuid>" }
+# List all types available to the user (system types + own types)
+GET /rest/v1/entry_type_definitions
+  ?select=id,slug,name,description,icon,color,layer,owner_type,schema_version,
+          field_definitions(*)
+  &or=(owner_type.eq.system,owner_id.eq.<user_id>)
+  &is_deprecated=eq.false
+  &order=owner_type.asc,name.asc
+
+# Get a single type with full field definitions
+GET /rest/v1/entry_type_definitions?slug=eq.book
+  &select=*,field_definitions(*)
+
+# Create a user-defined type
+POST /rest/v1/entry_type_definitions
+{
+  "slug": "research-note",
+  "name": "Research Note",
+  "description": "...",
+  "owner_type": "user",
+  "owner_id": "<user_id>",
+  "layer": "knowledge_base"
+}
+
+# Update a user-defined type (name, description, icon, color)
+PATCH /rest/v1/entry_type_definitions?id=eq.<uuid>&owner_id=eq.<user_id>
+{ "name": "Updated Name" }
 ```
 
-### Delete entry link
+### Field definitions (within a user type)
 ```
-DELETE /rest/v1/entry_links?source_entry_id=eq.<uuid>&target_entry_id=eq.<uuid>
-```
+# Add a field
+POST /rest/v1/field_definitions
+{
+  "type_definition_id": "uuid",
+  "field_key": "summary",
+  "label": "Key Insights",
+  "field_type": "markdown",
+  "display_group": "document",
+  "order": 1,
+  "required": true
+}
 
-### List templates (stored in a `templates` table, read-only)
-```
-GET /rest/v1/templates?select=type,template_markdown
-GET /rest/v1/templates?type=eq.note&select=type,template_markdown
+# Reorder / update label / hint / deprecate a field
+PATCH /rest/v1/field_definitions?id=eq.<uuid>
+{ "order": 2, "hint": "Summarise the key takeaways" }
+
+# Deprecate a field (never delete if data exists)
+PATCH /rest/v1/field_definitions?id=eq.<uuid>
+{ "is_deprecated": true }
 ```
 
 ### User profile
 ```
-GET  /rest/v1/profiles?id=eq.<user_id>&select=*
+GET  /rest/v1/profiles?id=eq.<user_id>&select=id,display_name,avatar_url,created_at
 PATCH /rest/v1/profiles?id=eq.<user_id>
 { "display_name": "...", "avatar_url": "..." }
 ```
@@ -245,37 +296,104 @@ Import is synchronous. Files are processed in the request; results are returned 
 ---
 
 ### `POST /functions/v1/mcp-server`
-The Stratinote MCP server. Implements the Model Context Protocol and is registered as the Claude.ai integration endpoint. Authenticates exclusively via Personal API Token.
+The Stratinote MCP server. Implements the MCP protocol and is registered as the Claude.ai integration endpoint. Authenticates exclusively via Personal API Token.
 
 **MCP Tools exposed:**
 
-| Tool | Description | Underlying operation |
-|------|-------------|---------------------|
-| `get_template` | Returns Markdown template for an entry type | `GET /rest/v1/templates?type=eq.<type>` |
-| `create_entry` | Persists a new entry from Markdown | Parses front-matter → `POST /rest/v1/entries` + resolve wiki-links |
-| `update_entry` | Updates an existing entry | `PATCH /rest/v1/entries?id=eq.<id>` |
-| `get_entry` | Retrieves an entry by ID or title | PostgREST lookup; title uses full-text match |
-| `list_projects` | Lists active project entries | `GET /rest/v1/entries?type=eq.project&status=eq.active` |
-| `search_knowledge_base` | Semantic/full-text search | Calls `search` Edge Function |
+| Tool | Input | Underlying operation |
+|------|-------|---------------------|
+| `list_entry_types` | (none) | PostgREST: system + user types, non-deprecated |
+| `get_type_schema` | `type_slug: string` | PostgREST: type + field_definitions |
+| `create_entry` | `type_slug`, `title`, `field_values: {key: value}`, `tags?` | validate → PostgREST insert |
+| `update_entry` | `entry_id`, `field_values: {key: value}`, `title?` | validate → PostgREST patch |
+| `get_entry` | `entry_id?`, `title?` | PostgREST lookup; title uses full-text search |
+| `list_projects` | (none) | PostgREST: `type_slug=eq.project&status=eq.active` |
+| `search_knowledge_base` | `query`, `limit?`, `type_slug?`, `project_id?` | `search` Edge Function |
 
-**`create_entry` accepts full Markdown:**
+**`get_type_schema` response** (what Claude uses to guide the conversation):
 ```json
 {
-  "markdown": "---\ntype: note\ntitle: My Note\ntags: [ai]\n---\n\nBody here."
+  "type_slug": "book",
+  "name": "Book Review",
+  "fields": [
+    { "key": "book_author", "label": "Author", "type": "text", "required": true, "hint": null },
+    { "key": "reading_status", "label": "Reading Status", "type": "select", "required": true,
+      "options": [{"value":"to-read","label":"To Read"},{"value":"reading","label":"Reading"},{"value":"completed","label":"Completed"}] },
+    { "key": "rating", "label": "Rating (1–5)", "type": "number", "required": false },
+    { "key": "summary", "label": "Key Insights", "type": "markdown", "required": true, "hint": "Main takeaways and ideas" },
+    { "key": "action_items", "label": "Action Items", "type": "markdown", "required": false }
+  ]
 }
 ```
-The Edge Function parses the YAML front-matter, extracts `related_entries` (resolves to `entry_links`), and inserts the structured entry.
+
+**`create_entry` input:**
+```json
+{
+  "type_slug": "book",
+  "title": "Thinking, Fast and Slow",
+  "tags": ["psychology", "decision-making"],
+  "field_values": {
+    "book_author": "Daniel Kahneman",
+    "reading_status": "completed",
+    "rating": 5,
+    "summary": "## Core Argument\nKahneman distinguishes...",
+    "action_items": "- Apply pre-mortem to next project"
+  }
+}
+```
 
 **`search_knowledge_base` input:**
 ```json
 {
   "query": "string",
   "limit": 5,
-  "type": "entry_type | null",
+  "type_slug": "note | null",
   "project_id": "uuid | null"
 }
 ```
-Returns full entry body for Claude's context window.
+Returns full field values so Claude has complete context.
+
+---
+
+### `POST /functions/v1/admin`
+Superadmin operations. **Requires Supabase JWT from a superadmin user.** Not callable via PAT.
+
+**Actions:**
+
+```json
+{ "action": "list_users", "page": 1, "limit": 50 }
+```
+```json
+{ "action": "suspend_user", "user_id": "uuid" }
+{ "action": "unsuspend_user", "user_id": "uuid" }
+{ "action": "delete_user", "user_id": "uuid" }
+```
+```json
+{ "action": "create_invite", "email": "optional@email.com", "expires_at": "ISO8601 | null" }
+{ "action": "list_invites", "status": "pending | used | expired | revoked | all" }
+{ "action": "revoke_invite", "invite_id": "uuid" }
+```
+```json
+{ "action": "get_health" }
+```
+```json
+{ "action": "create_system_type", "slug": "...", "name": "...", "layer": "knowledge_base", "fields": [...] }
+{ "action": "update_system_type", "type_id": "uuid", "fields": [...] }
+{ "action": "deprecate_system_type", "type_id": "uuid" }
+{ "action": "requeue_failed_embeddings" }
+```
+
+**`get_health` response:**
+```json
+{
+  "users": { "total": 42, "active_7d": 18, "active_30d": 31, "suspended": 1 },
+  "entries": { "total": 1204, "by_type": { "note": 400, "book": 120, "..." : "..." } },
+  "embeddings": { "queue_depth": 3, "failed_24h": 0, "total": 1201 },
+  "types": { "system": 6, "user_defined": 29 }
+}
+```
+
+All superadmin actions are written to `audit_log`. Non-superadmin callers receive HTTP 403.
 
 ---
 
