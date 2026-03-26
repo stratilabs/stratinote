@@ -28,8 +28,8 @@ The system architecture shall support up to **1,000 concurrent users** without d
 ### NFR-006 — Entry Volume
 The system shall perform within NFR-001 and NFR-002 bounds for users with up to **10,000 entries** each.
 
-### NFR-007 — Stateless API
-The backend API shall be stateless, enabling horizontal scaling behind a load balancer.
+### NFR-007 — Stateless Edge Functions
+All Supabase Edge Functions are stateless by design. Scaling is handled by Supabase's managed infrastructure.
 
 ---
 
@@ -52,23 +52,26 @@ If the Claude API or embedding service is unavailable, the system shall:
 ## 4. Maintainability
 
 ### NFR-011 — Code Coverage
-All non-trivial business logic shall have unit test coverage of at least **80%**. Critical paths (auth, RLS, entry CRUD, search) shall have integration test coverage.
+All non-trivial business logic in Edge Functions shall have unit test coverage of at least **80%**. Critical paths (auth/PAT validation, RLS, entry CRUD, search) shall have integration test coverage.
 
 ### NFR-012 — Type Safety
-The backend and frontend code shall be written in TypeScript with strict mode enabled. Any `any` types shall require explicit justification via a comment.
+All Edge Function and frontend code shall be written in TypeScript with strict mode enabled. Any `any` types shall require explicit justification via a comment.
 
 ### NFR-013 — Linting and Formatting
 All code shall pass ESLint and Prettier checks as part of the CI pipeline. Commits that fail these checks shall not be merged.
 
 ### NFR-014 — Environment Configuration
-All environment-specific values (API keys, database URLs, feature flags) shall be managed via environment variables. No secrets shall be committed to the repository.
+All environment-specific values (Supabase URL, service role key, Anthropic API key, embedding model key) shall be managed as Supabase project secrets (for Edge Functions) and as `.env.local` variables (for the Next.js frontend). No secrets shall be committed to the repository.
 
 ### NFR-015 — Logging
-The backend shall emit structured JSON logs for all API requests and errors, including: timestamp, request ID, user ID (hashed), status code, and duration. No PII shall appear in logs.
+Edge Functions shall emit structured JSON logs for all requests and errors, including: timestamp, request ID, user ID (hashed), function name, status code, and duration. No PII shall appear in logs. Logs are accessible via the Supabase dashboard.
 
 ---
 
 ## 5. Usability
+
+### NFR-015a — Structured Editor Responsiveness
+The structured document editor shall render and become interactive within **1 second** of the entry page loading, for entries with up to 20 fields and 50,000 characters of total content. Typing in any field shall have less than **50ms** input latency (no perceptible lag).
 
 ### NFR-016 — Mobile Compatibility
 The web UI shall be responsive and usable on mobile screens (≥ 375px width).
@@ -84,10 +87,10 @@ The web UI shall conform to WCAG 2.1 Level AA standards.
 ## 6. Extensibility
 
 ### NFR-019 — Entry Type Registry
-New entry types shall be addable by defining a template file and schema — no changes to core API logic required. See [Extension Points](./07-extension-points.md).
+New entry types shall be addable via the web UI (for users and superadmins) or via a Supabase migration (for bulk seeding) — no application code deployment required. The MCP integration, structured editor, search, export, and versioning all handle new types generically. See [Extension Points](./07-extension-points.md).
 
-### NFR-020 — Claude Skills Registry
-New Claude skills shall be addable by registering a new skill definition — no changes to the core skill dispatcher required.
+### NFR-020 — MCP Tools Registry
+New MCP tools shall be addable by registering a new tool handler in the `mcp-server` Edge Function — no changes to the core MCP dispatcher required. See [Extension Points §3](./07-extension-points.md).
 
 ### NFR-021 — Embedding Model Abstraction
-The embedding model shall be configurable via an environment variable, with an adapter interface enabling swap to a different provider without changing business logic.
+The embedding model shall be configurable via a Supabase project secret (`EMBEDDING_PROVIDER`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`), with an adapter interface in the `process-embedding-queue` Edge Function enabling provider swap without changing business logic. Changing the model requires a re-embedding migration (see Extension Points).
