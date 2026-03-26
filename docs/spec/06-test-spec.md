@@ -93,14 +93,15 @@ THEN the entry row is permanently removed from the database
 AND all associated entry_links and entry_embeddings are removed
 ```
 
-### T-U006 — Template Retrieval (FR-002)
+### T-U006 — Type Schema Retrieval (FR-006, FR-002)
 ```
-GIVEN a request to GET /templates/note
-THEN a markdown template string is returned
-AND it contains a valid YAML front-matter block with type: note
+GIVEN the MCP tool get_type_schema is called with type_slug='book'
+THEN a structured field list is returned (not a Markdown template)
+AND each field has: field_key, label, field_type, required, options (if applicable), hint
+AND fields are ordered by their display_group and order properties
 
-GIVEN a request to GET /templates/unknown_type
-THEN HTTP 404 is returned
+GIVEN get_type_schema is called with type_slug='nonexistent_type'
+THEN an MCP tool error is returned (NOT_FOUND)
 ```
 
 ### T-U007 — updated_at Trigger (Data Model)
@@ -420,11 +421,12 @@ AFTER 3 failures THEN status='failed' and last_error is populated
 ```
 GIVEN a valid .md file with correct front-matter
 WHEN POST /import is called with the file
-THEN HTTP 202 is returned with imported: 1
+THEN HTTP 200 is returned with imported: 1
 
 GIVEN a .md file missing required front-matter field `type`
 WHEN POST /import is called
-THEN the file is reported in the errors array with the reason
+THEN HTTP 200 is returned and the file is reported in the errors array with the reason
+AND the valid files in the same request are still imported
 ```
 
 ---

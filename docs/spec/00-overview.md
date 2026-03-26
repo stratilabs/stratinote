@@ -15,7 +15,7 @@ The guiding principle: **the system adapts to the user, not the other way around
 3. Enable semantic retrieval of past knowledge inside Claude sessions (RAG).
 4. Provide a clean web UI for browsing, searching, and editing entries.
 5. Support multiple isolated users with strong security guarantees.
-6. Be extensible: new entry types, templates, and AI skills can be added with minimal friction.
+6. Be extensible: new entry types, field schemas, and MCP tools can be added with minimal friction.
 
 ---
 
@@ -35,6 +35,7 @@ The guiding principle: **the system adapts to the user, not the other way around
 | **Entry Version** | A point-in-time snapshot of an entry's `title`, `metadata`, and `tags` stored on every save. Used for history browsing and restore. |
 | **Embedding** | A vector representation of an entry's content stored in Supabase for semantic search. Always reflects the current (latest) version. |
 | **RAG** | Retrieval-Augmented Generation — pulling relevant entries from the knowledge base to augment a Claude session. |
+| **Space Share** | A grantor-controlled read-only access grant giving another registered user (grantee) access to all entries in a specified layer or project. The grantee can read and search shared entries but cannot modify them. |
 | **RLS** | Row Level Security — Supabase/PostgreSQL policy system that enforces per-user data isolation at the database level. |
 
 ---
@@ -55,9 +56,10 @@ There is **no custom backend server**. All backend logic runs inside Supabase:
                          │
 ┌────────────────────────▼─────────────────────────────────────┐
 │            Supabase Edge Function: mcp-server                │
-│  MCP tools: create_entry · search_knowledge_base ·           │
-│             get_type_schema · get_entry · list_projects ·    │
-│             list_entry_types · list_rag_contexts             │
+│  MCP tools: create_entry · update_entry ·                    │
+│             search_knowledge_base · get_type_schema ·        │
+│             get_entry · list_projects · list_entry_types ·   │
+│             list_rag_contexts · list_shared_spaces           │
 └────────────────────────┬─────────────────────────────────────┘
                          │ Supabase client (internal)
 ┌────────────────────────▼─────────────────────────────────────┐
@@ -70,13 +72,17 @@ There is **no custom backend server**. All backend logic runs inside Supabase:
 │  └──────────────────┘                                        │
 │                                                              │
 │  Edge Functions:                                             │
-│  · mcp-server          (MCP protocol handler)                │
-│  · search              (semantic + full-text search)         │
-│  · process-embeddings  (embedding queue worker, cron)        │
-│  · manage-tokens       (PAT create/revoke)                   │
-│  · export-import       (selective ZIP export, import)        │
-│  · admin               (superadmin operations)               │
-│  · purge-trash         (auto-hard-delete cron, cron)         │
+│  · mcp-server               (MCP protocol handler)           │
+│  · search                   (semantic + full-text search)    │
+│  · process-embedding-queue  (embedding queue worker, cron)   │
+│  · manage-tokens            (PAT create/revoke)              │
+│  · manage-shares            (space share create/revoke)      │
+│  · export                   (selective ZIP export)           │
+│  · import                   (Markdown import)                │
+│  · restore-version          (version restore)                │
+│  · trash                    (restore/hard-delete/empty)      │
+│  · admin                    (superadmin operations)          │
+│  · purge-trash              (auto-hard-delete cron)          │
 └────────────────────────┬─────────────────────────────────────┘
                          │ Supabase JS client (anon/user JWT)
 ┌────────────────────────▼─────────────────────────────────────┐
@@ -119,8 +125,6 @@ There is **no custom backend server**. All backend logic runs inside Supabase:
 
 | Layer | Technology | Rationale |
 |-------|-----------|-----------|
-| Layer | Technology | Rationale |
-|-------|-----------|-----------|
 | Database | Supabase PostgreSQL 15+ | Managed, supports pgvector, built-in auth and RLS |
 | Vector search | pgvector (Supabase) | Co-located with data; semantic search via `match_entries` DB function |
 | Auth | Supabase Auth | JWT, email/password, optional OAuth; integrates natively with RLS |
@@ -144,4 +148,4 @@ There is **no custom backend server**. All backend logic runs inside Supabase:
 | 04 | [API Specification](./04-api-spec.md) | Endpoint contracts |
 | 05 | [Security Specification](./05-security-spec.md) | Auth, RLS, threat model |
 | 06 | [Test Specification](./06-test-spec.md) | Test strategy and cases |
-| 07 | [Extension Points](./07-extension-points.md) | How to add entry types, templates, skills |
+| 07 | [Extension Points](./07-extension-points.md) | How to add entry types, MCP tools, embedding providers |

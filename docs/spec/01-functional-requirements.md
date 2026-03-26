@@ -97,7 +97,7 @@ The system shall support Create, Read, Update, and Delete operations for all ent
 - Update: the `updated_at` timestamp is refreshed on every update; entry type and field keys cannot be changed after creation. Write operations (update, delete, restore) are rejected for shared entries — only the owner can modify them.
 - All field values in `metadata` are validated against the type's field definitions at write time; missing required fields cause a validation error.
 - Delete: soft-delete by default (`status = 'deleted'`, `deleted_at` set); hard-delete available as a separate explicit action.
-- Restore: a soft-deleted entry can be restored to its previous status (`active` or `draft`); `deleted_at` is cleared.
+- Restore: a soft-deleted entry can be restored to its previous status (`active`, `draft`, or `archived`); `deleted_at` is cleared. The pre-deletion status is preserved in the trash view to allow accurate restoration.
 - Every save (create or update to `title`, `metadata`, or `tags`) writes a snapshot to `entry_versions`.
 - All operations enforce RLS (see Security Specification).
 
@@ -177,15 +177,18 @@ The system shall implement a Stratinote MCP server that registers the following 
 | `get_type_schema` | Returns the field definitions for a given type slug or ID |
 | `create_entry` | Persists a new entry as structured field values |
 | `update_entry` | Updates an existing entry by ID |
-| `search_knowledge_base` | Semantic search over the user's knowledge base |
+| `search_knowledge_base` | Semantic search over the user's knowledge base (owned + optionally shared) |
 | `get_entry` | Retrieves a single entry by ID or title |
-| `list_projects` | Lists available project entries for meeting linking |
+| `list_projects` | Lists available project entries for meeting linking (owned + optionally shared) |
+| `list_rag_contexts` | Lists the user's saved RAG context filter configurations |
+| `list_shared_spaces` | Lists spaces other users have shared with the requesting user |
 
 **Acceptance Criteria:**
 - The MCP server implements the MCP protocol spec and is registerable in Claude.ai as a remote integration.
 - Each tool has a clear name, description, and typed input schema so Claude can invoke it correctly without user guidance.
-- `get_type_schema` returns an ordered list of field definitions (key, label, type, required, options, hint) — not a Markdown template.
+- `get_type_schema` returns an ordered list of field definitions (`field_key`, `label`, `field_type`, `required`, `options`, `hint`) — not a Markdown template.
 - `create_entry` accepts a structured map of `{ field_key: value }` pairs, validated server-side against the type schema.
+- `list_shared_spaces` returns incoming share grants with grantor display name, share type, and scope so Claude can inform the user which external knowledge is accessible.
 - All tool calls are authenticated via the Personal API Token in the request header (see FR-022).
 - A tool call with an invalid or expired token returns a structured MCP error; Claude surfaces this to the user.
 - The MCP server is a Supabase Edge Function.
@@ -212,7 +215,7 @@ The Claude.ai integration shall enable the user to create a new entry through na
 - `create_entry` validates the Markdown against the entry type schema server-side before persisting; validation errors are returned as tool errors and surfaced by Claude.
 - On success, the MCP tool returns the entry ID and a direct URL to the web UI.
 - On failure, Claude surfaces the error and offers to retry.
-- Supported entry types: `note`, `idea`, `article`, `book`, `project`, `meeting`.
+- Works with any available entry type (system types and user-defined types); the type list is dynamic and fetched via `list_entry_types`.
 
 ---
 
@@ -641,8 +644,8 @@ A context with no filters (all null/false) is equivalent to "search only my own 
 A project entry shall be able to declare a default RAG context. When a user works on that project in Claude, this context is automatically activated without requiring manual selection.
 
 **Acceptance Criteria:**
-- The system `project` type includes an optional field `default_rag_context` of type `entry_reference`-equivalent pointing to a RAG context ID (stored in `metadata`).
-- When Claude calls `search_knowledge_base` while the active project context is set (via `list_projects` + user selection), the project's default RAG context is applied if no explicit `context_id` is passed.
+- The system `project` type includes an optional `text` field `default_rag_context_id` (stored in `metadata`) whose value is the UUID of a `rag_contexts` row belonging to the same user. This is a soft reference (not a true FK `entry_reference`), validated at the application layer.
+- When Claude calls `search_knowledge_base` while the active project context is set (via `list_projects` + user selection), the project's `default_rag_context_id` is applied as the `context_id` if no explicit `context_id` is passed.
 - The `list_projects` MCP tool response includes `default_rag_context_id` so Claude can inform the user which knowledge scope will apply.
 
 ---
@@ -734,7 +737,7 @@ Soft-deleted entries shall be accessible in a Trash view, and users shall be abl
 
 **Acceptance Criteria:**
 - The Trash view lists all entries with `status = 'deleted'`, showing title, type, and `deleted_at` date.
-- A user can restore a soft-deleted entry; it is returned to `status = 'active'` (or `'draft'` if it was never active) and `deleted_at` is cleared.
+- A user can restore a soft-deleted entry; it is returned to its pre-deletion status (`active`, `draft`, or `archived`) and `deleted_at` is cleared. The pre-deletion status is stored on the `entries` row when soft-deleting.
 - A user can permanently (hard) delete a single entry from the Trash.
 - "Empty Trash" permanently deletes all of the user's soft-deleted entries at once.
 - Soft-deleted entries are excluded from all search, listing, and RAG operations.

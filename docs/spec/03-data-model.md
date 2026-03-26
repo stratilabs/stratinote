@@ -153,13 +153,14 @@ The core table. All field values are stored in `metadata` keyed by `field_key`. 
 | `schema_version` | `integer` | NOT NULL | Schema version at write time; for future migration tooling |
 | `title` | `text` | NOT NULL | Always present; used for display, search, wiki-link resolution |
 | `metadata` | `jsonb` | NOT NULL, DEFAULT '{}' | All field values: `{ "field_key": value, ... }` |
-| `search_text` | `text` | GENERATED ALWAYS AS (...) STORED | Concatenation of title + all text-type field values; used for full-text GIN index |
+| `search_text` | `text` | NOT NULL, DEFAULT '' | Maintained by `update_search_text` trigger (not a true generated column — see notes below); concatenation of title + all text-type field values; used for full-text GIN index |
 | `tags` | `text[]` | NOT NULL, DEFAULT '{}' | Searchable tags (system field) |
 | `status` | `entry_status` | NOT NULL, DEFAULT 'draft' | |
 | `project_id` | `uuid` | NULLABLE, FK → `entries.id` | Denormalized from the `entry_reference` field with `entry_reference_type: project`; maintained by trigger |
 | `created_at` | `timestamptz` | NOT NULL, DEFAULT now() | |
 | `updated_at` | `timestamptz` | NOT NULL, DEFAULT now() | |
 | `deleted_at` | `timestamptz` | NULLABLE | Soft delete timestamp |
+| `pre_deletion_status` | `entry_status` | NULLABLE | Status before soft-deletion (`active`, `draft`, or `archived`); used to restore the correct status on undelete |
 
 **Notes on `search_text`:**
 The generated column concatenates `title` and the values of all fields with `field_type IN ('text', 'long_text', 'markdown')`. Because PostgreSQL generated columns cannot call user-defined functions directly, this concatenation is maintained by the `update_search_text` trigger instead of a true generated column. The column is functionally equivalent.
