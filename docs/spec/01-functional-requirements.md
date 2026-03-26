@@ -96,7 +96,9 @@ The system shall support Create, Read, Update, and Delete operations for all ent
 - Read: entries are retrievable by ID; only entries owned by the requesting user are returned.
 - Update: the `updated_at` timestamp is refreshed on every update; entry type and field keys cannot be changed after creation.
 - All field values in `metadata` are validated against the type's field definitions at write time; missing required fields cause a validation error.
-- Delete: soft-delete by default (status set to `deleted`); hard-delete available as a separate explicit action.
+- Delete: soft-delete by default (`status = 'deleted'`, `deleted_at` set); hard-delete available as a separate explicit action.
+- Restore: a soft-deleted entry can be restored to its previous status (`active` or `draft`); `deleted_at` is cleared.
+- Every save (create or update to `title`, `metadata`, or `tags`) writes a snapshot to `entry_versions`.
 - All operations enforce RLS (see Security Specification).
 
 ---
@@ -217,20 +219,22 @@ The Claude.ai integration shall enable the user to create a new entry through na
 ### FR-008 — Semantic Knowledge Retrieval (RAG) via Claude.ai
 **Priority:** P1
 
-During any Claude.ai session with the Stratinote integration active, Claude shall be able to retrieve semantically relevant entries from the user's knowledge base to answer questions or provide context.
+During any Claude.ai session with the Stratinote integration active, Claude shall retrieve semantically relevant entries scoped by an optional RAG context, preventing knowledge from different projects and spaces bleeding into each other.
 
 **Flow:**
 1. User asks a question or requests context ("what do I know about X?").
-2. Claude calls `search_knowledge_base` with a semantic query.
-3. The MCP server calls the backend search API using the Personal API Token.
-4. Retrieved entries (title, excerpt, entry ID) are returned to Claude.
-5. Claude answers using the retrieved content, citing the entry titles as sources.
+2. Claude calls `search_knowledge_base` with a query and optional `context_id`.
+3. The MCP server applies the RAG context's filters before running the vector/full-text search.
+4. Retrieved entries (title, full field values, entry ID) are returned to Claude.
+5. Claude answers using the retrieved content, citing entry titles as sources.
 
 **Acceptance Criteria:**
-- `search_knowledge_base` accepts: `query` (string), `limit` (int, default 5, max 20), optional `type` and `project_id` filters.
-- Only entries belonging to the token's owner are searched.
-- Retrieved entries include full body content so Claude has complete context.
-- Claude attributes answers to specific entries by title.
+- `search_knowledge_base` accepts: `query` (string), `limit` (int, default 5, max 20), optional `context_id` (uuid), optional `type_slug` and `project_id` filters.
+- If `context_id` is provided, the search is filtered to only entries matching that context's configuration.
+- If no `context_id` is provided, the user's default RAG context is applied if one exists; otherwise all entries are searched.
+- Only entries belonging to the token's owner are searched (RLS applies regardless of context).
+- Retrieved entries include full field values so Claude has complete structured context.
+- Soft-deleted entries are excluded regardless of context configuration.
 - RAG works in any conversation, not only entry-creation flows.
 
 ---
@@ -418,15 +422,45 @@ The system shall expose a semantic search endpoint that accepts a natural langua
 
 ## 6. Data Portability
 
-### FR-020 — Export Knowledge Base
-**Priority:** P3
+### FR-020 — Selective Export
+**Priority:** P2
 
-Users shall be able to export their entire knowledge base as a ZIP archive of Markdown files.
+Users shall be able to export entries as a ZIP archive of Markdown files with configurable scope. Export scope can be narrowed to avoid exporting irrelevant data.
+
+**Export scope options (combinable):**
+
+| Scope | Description |
+|-------|-------------|
+| `all` | All non-deleted entries (default) |
+| `layer` | `knowledge_base` or `project_workspace` only |
+| `type_slugs` | One or more specific type slugs |
+| `project_id` | All entries linked to a specific project |
+| `rag_context_id` | All entries matching a saved RAG context's filters |
+| `entry_ids` | Explicit list of entry IDs |
+
+**ZIP structure:**
+```
+stratinote-export/
+  <type_slug>/
+    <entry-title-slug>.md       ← knowledge_base entries
+  projects/
+    <project-title-slug>/
+      project.md                ← the project entry itself
+      <linked-entry-slug>.md    ← all entries linked to this project
+```
+
+**Each `.md` file contains:**
+- YAML front-matter: `type_slug`, `title`, `tags`, `status`, all field values
+- `related_entries` resolved to titles (not UUIDs) for human readability
+- Markdown field values as document sections
+- Export timestamp in front-matter
 
 **Acceptance Criteria:**
-- Export includes all non-deleted entries as `.md` files with front-matter intact.
-- Files are organised into folders by entry type.
-- Export is downloadable from the web UI.
+- The export Edge Function accepts the scope parameters and returns a ZIP binary.
+- Scope filters are validated; invalid `project_id` or `rag_context_id` returns a 404.
+- An export with zero matching entries returns a 422 with a clear message.
+- Export is downloadable from the web UI via a scope picker dialog.
+- If a `rag_context_id` is provided, the export uses the exact same filter logic as `search_knowledge_base`, ensuring consistency between what Claude sees and what is exported.
 
 ---
 
@@ -437,8 +471,9 @@ Users shall be able to import Markdown files (with compatible front-matter) into
 
 **Acceptance Criteria:**
 - System validates front-matter on import; invalid files are reported with details.
-- Duplicate detection by title + type; user is prompted to skip or overwrite.
+- Duplicate detection by title + type_slug; user is prompted to skip or overwrite.
 - Imported entries are embedded on ingest.
+- Import respects the current schema: if the front-matter `type_slug` matches a known type, field values are validated against the type's field definitions.
 
 ---
 
@@ -564,3 +599,110 @@ The superadmin shall have a dashboard showing system health and usage metrics.
 - Dashboard refreshes on page load; no real-time streaming required.
 - All metrics are scoped to the production project and visible only to superadmins.
 - A "re-queue failed embeddings" action allows superadmin to reset all `failed` queue items to `pending`.
+
+---
+
+## 10. RAG Contexts
+
+### FR-031 — RAG Context Management
+**Priority:** P1
+
+Users shall be able to define, save, and manage named RAG contexts that scope which entries Claude searches, preventing knowledge from different projects or topics mixing in the same conversation.
+
+**A RAG context filter can combine:**
+
+| Filter | Description |
+|--------|-------------|
+| `layers` | `knowledge_base`, `project_workspace`, or both |
+| `type_slugs` | Restrict to specific entry type slugs |
+| `project_ids` | Include entries linked to specific projects |
+| `exclude_project_ids` | Exclude entries from specific projects |
+| `tags` | Include only entries containing all specified tags |
+
+A context with no filters (all null) is equivalent to "search everything" and serves as a global context.
+
+**Acceptance Criteria:**
+- Users can create, name, update, and delete their own RAG contexts.
+- A user can mark one context as `is_default`; it is used automatically when no `context_id` is passed to `search_knowledge_base`.
+- Only one context per user can be `is_default` (enforced via trigger or unique partial index).
+- Deleting a context does not affect entries; it removes the filter configuration only.
+- RAG contexts are user-private; no cross-user access.
+- The list of the user's contexts is accessible via the MCP `list_rag_contexts` tool.
+
+---
+
+### FR-032 — Project Default RAG Context
+**Priority:** P2
+
+A project entry shall be able to declare a default RAG context. When a user works on that project in Claude, this context is automatically activated without requiring manual selection.
+
+**Acceptance Criteria:**
+- The system `project` type includes an optional field `default_rag_context` of type `entry_reference`-equivalent pointing to a RAG context ID (stored in `metadata`).
+- When Claude calls `search_knowledge_base` while the active project context is set (via `list_projects` + user selection), the project's default RAG context is applied if no explicit `context_id` is passed.
+- The `list_projects` MCP tool response includes `default_rag_context_id` so Claude can inform the user which knowledge scope will apply.
+
+---
+
+## 11. Entry Versioning
+
+### FR-033 — Entry Version History
+**Priority:** P2
+
+Every time an entry's content (`title`, `metadata`, or `tags`) is saved, the system shall create a version snapshot, allowing users to review the history and understand how an entry evolved.
+
+**What is versioned:** `title`, `metadata` (all field values), `tags`
+**What is NOT versioned:** `status`, `entry_links` (managed separately), `type_definition_id` (immutable)
+
+**Acceptance Criteria:**
+- A version snapshot is created on entry creation and on every update that changes `title`, `metadata`, or `tags`.
+- Versions are numbered sequentially per entry starting from 1.
+- The most recent 50 versions are retained per entry; older versions are pruned automatically.
+- Each version stores: version number, `title`, `metadata`, `tags`, `saved_by` (user_id), `created_at`.
+- An auto-generated `change_summary` is computed by comparing field-level diffs to the previous version (e.g., "Updated Key Insights; added tag 'psychology'").
+- The version history is accessible from the entry's page in the web UI.
+- The MCP `get_entry` tool can optionally return the version count so Claude can inform the user.
+
+---
+
+### FR-034 — Version Restore
+**Priority:** P2
+
+Users shall be able to restore an entry to any of its saved versions.
+
+**Acceptance Criteria:**
+- Restoring a version replaces the current entry's `title`, `metadata`, and `tags` with the version snapshot values.
+- A restore operation itself creates a new version (so the restore is part of the history, not a silent overwrite).
+- Restoring a version triggers re-embedding of the entry.
+- Entry `status` and `entry_links` are not affected by a restore.
+- The web UI shows a diff view between the selected version and the current state before confirming restore.
+
+---
+
+## 12. Trash and Auto-Purge
+
+### FR-035 — Trash View and Restore
+**Priority:** P2
+
+Soft-deleted entries shall be accessible in a Trash view, and users shall be able to restore them or permanently delete them individually.
+
+**Acceptance Criteria:**
+- The Trash view lists all entries with `status = 'deleted'`, showing title, type, and `deleted_at` date.
+- A user can restore a soft-deleted entry; it is returned to `status = 'active'` (or `'draft'` if it was never active) and `deleted_at` is cleared.
+- A user can permanently (hard) delete a single entry from the Trash.
+- "Empty Trash" permanently deletes all of the user's soft-deleted entries at once.
+- Soft-deleted entries are excluded from all search, listing, and RAG operations.
+- Version history is preserved through soft delete and restored on restore.
+
+---
+
+### FR-036 — Auto-Purge of Soft-Deleted Entries
+**Priority:** P2
+
+Entries that have been soft-deleted for longer than the configured retention period shall be permanently deleted automatically.
+
+**Acceptance Criteria:**
+- The `TRASH_RETENTION_DAYS` environment variable (default: 30) controls the retention period.
+- A `purge-trash` Edge Function runs on a daily cron schedule and permanently deletes entries where `deleted_at < now() - TRASH_RETENTION_DAYS days`.
+- Before purging, each qualifying entry's data (metadata, version history) is gone permanently — no recovery.
+- The purge is logged in `audit_log` with the count of entries deleted.
+- Superadmins can view purge history in the health dashboard.

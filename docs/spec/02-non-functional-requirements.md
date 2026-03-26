@@ -87,10 +87,10 @@ The web UI shall conform to WCAG 2.1 Level AA standards.
 ## 6. Extensibility
 
 ### NFR-019 — Entry Type Registry
-New entry types shall be addable by defining a template file and schema — no changes to core API logic required. See [Extension Points](./07-extension-points.md).
+New entry types shall be addable via the web UI (for users and superadmins) or via a Supabase migration (for bulk seeding) — no application code deployment required. The MCP integration, structured editor, search, export, and versioning all handle new types generically. See [Extension Points](./07-extension-points.md).
 
-### NFR-020 — Claude Skills Registry
-New Claude skills shall be addable by registering a new skill definition — no changes to the core skill dispatcher required.
+### NFR-020 — MCP Tools Registry
+New MCP tools shall be addable by registering a new tool handler in the `mcp-server` Edge Function — no changes to the core MCP dispatcher required. See [Extension Points §3](./07-extension-points.md).
 
 ### NFR-021 — Embedding Model Abstraction
 The embedding model shall be configurable via a Supabase project secret (`EMBEDDING_PROVIDER`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`), with an adapter interface in the `process-embedding-queue` Edge Function enabling provider swap without changing business logic. Changing the model requires a re-embedding migration (see Extension Points).

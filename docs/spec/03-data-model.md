@@ -7,10 +7,12 @@
 ```
 profiles (1) ──── (N) entries
 profiles (1) ──── (N) entry_type_definitions   [user-owned types]
+profiles (1) ──── (N) rag_contexts
 entry_type_definitions (1) ──── (N) field_definitions
 entry_type_definitions (1) ──── (N) entries    [via type_definition_id]
 entries   (N) ──── (N) entries                 [via entry_links]
 entries   (1) ──── (1) entry_embeddings
+entries   (1) ──── (N) entry_versions
 auth.users (1) ──── (N) api_tokens
 auth.users (1) ──── (N) invites                [created_by]
 ```
@@ -264,6 +266,65 @@ Personal API Tokens for MCP authentication.
 
 ---
 
+### `rag_contexts`
+
+Named, saved filter configurations that scope `search_knowledge_base` results. Owned by individual users.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `id` | `uuid` | PK, DEFAULT gen_random_uuid() | |
+| `user_id` | `uuid` | NOT NULL, FK → `auth.users.id` ON DELETE CASCADE | Owner |
+| `name` | `text` | NOT NULL | Display name (e.g. "Project Alpha + Psychology KB") |
+| `description` | `text` | NULLABLE | Optional description |
+| `is_default` | `boolean` | NOT NULL, DEFAULT false | Applied automatically when no context_id is specified |
+| `filter` | `jsonb` | NOT NULL, DEFAULT '{}' | See filter schema below |
+| `created_at` | `timestamptz` | NOT NULL, DEFAULT now() | |
+| `updated_at` | `timestamptz` | NOT NULL, DEFAULT now() | |
+
+**Filter schema (`filter` jsonb):**
+```jsonb
+{
+  "layers": ["knowledge_base", "project_workspace"],  // null = all layers
+  "type_slugs": ["note", "book"],                     // null = all types
+  "project_ids": ["uuid1", "uuid2"],                  // null = all projects
+  "exclude_project_ids": ["uuid3"],                   // null = exclude nothing
+  "tags": ["python", "ai"]                            // null = all tags
+}
+```
+An empty `{}` filter (all null fields) means "search everything" — valid as a named global context.
+
+**Constraints:**
+- UNIQUE partial index: `(user_id) WHERE is_default = true` — only one default per user.
+
+**RLS:** Users can only read, create, update, and delete their own contexts.
+
+---
+
+### `entry_versions`
+
+Point-in-time snapshots of entry content. Written on every save that changes `title`, `metadata`, or `tags`. Provides history and restore capability.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `id` | `uuid` | PK, DEFAULT gen_random_uuid() | |
+| `entry_id` | `uuid` | NOT NULL, FK → `entries.id` ON DELETE CASCADE | Parent entry |
+| `version_number` | `integer` | NOT NULL | Sequential per entry, starting at 1 |
+| `title` | `text` | NOT NULL | Snapshot of title at this version |
+| `metadata` | `jsonb` | NOT NULL | Snapshot of all field values |
+| `tags` | `text[]` | NOT NULL | Snapshot of tags |
+| `saved_by` | `uuid` | NOT NULL, FK → `auth.users.id` | User who saved this version |
+| `change_summary` | `text` | NULLABLE | Auto-generated diff summary (e.g. "Updated Key Insights; added tag 'ai'") |
+| `created_at` | `timestamptz` | NOT NULL, DEFAULT now() | When this version was saved |
+
+**Constraints:**
+- UNIQUE `(entry_id, version_number)`
+
+**Retention:** A trigger prunes versions older than the 50 most recent per entry after each insert.
+
+**RLS:** Users can only read versions of their own entries. No user write access (versions are written by the `snapshot_version` trigger only).
+
+---
+
 ### `audit_log`
 
 Immutable event log for sensitive operations. Service role only — not user-readable via API.
@@ -303,13 +364,15 @@ LANGUAGE plpgsql SECURITY DEFINER;
 | Trigger | On | Action |
 |---------|-----|--------|
 | `handle_new_user` | INSERT `auth.users` | Creates `profiles` row |
-| `set_updated_at` | UPDATE `entries`, `profiles`, `entry_type_definitions`, `embedding_queue` | Sets `updated_at = now()` |
+| `set_updated_at` | UPDATE `entries`, `profiles`, `entry_type_definitions`, `embedding_queue`, `rag_contexts` | Sets `updated_at = now()` |
 | `queue_embedding_on_change` | INSERT OR UPDATE `entries` (title or metadata changed) | Upserts `embedding_queue` row with `status='pending'` |
 | `sync_project_id` | INSERT OR UPDATE `entries` | Copies `entry_reference` field value with `entry_reference_type='project'` into denormalized `project_id` |
 | `update_search_text` | INSERT OR UPDATE `entries` | Rebuilds `search_text` from title + all text-type field values via type schema lookup |
+| `snapshot_version` | INSERT OR UPDATE `entries` (when `title`, `metadata`, or `tags` changed) | Inserts a row into `entry_versions` with computed `change_summary`; prunes versions beyond 50 for this entry |
 | `enforce_token_limit` | INSERT `api_tokens` | Raises exception if user has ≥ 10 active tokens |
 | `prevent_field_type_change` | UPDATE `field_definitions` | Raises exception if `field_type` changes and any entry uses that field |
 | `increment_schema_version` | INSERT OR UPDATE OR DELETE `field_definitions` | Increments `entry_type_definitions.schema_version` |
+| `enforce_single_default_context` | INSERT OR UPDATE `rag_contexts` | If `is_default = true`, sets `is_default = false` on all other contexts for that user |
 
 ---
 

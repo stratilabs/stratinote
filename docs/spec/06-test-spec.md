@@ -170,6 +170,23 @@ WHEN GET /entries?project_id=P.id is called
 THEN entry M is returned
 ```
 
+### T-I004b — Selective Export (FR-020)
+```
+GIVEN a user with 10 entries across types 'note' and 'book', and 3 meeting entries
+WHEN export is called with scope { type_slugs: ["book"] }
+THEN the ZIP contains only the 3 book entries, in a 'book/' folder
+
+WHEN export is called with scope { project_id: "<uuid>" }
+THEN the ZIP contains the project entry and all linked entries under projects/<name>/
+
+WHEN export is called with scope { rag_context_id: "<uuid>" }
+THEN the ZIP contains exactly the entries that search_knowledge_base would return for that context
+
+GIVEN scope { type_slugs: ["nonexistent"] } matching zero entries
+WHEN export is called
+THEN HTTP 422 is returned with a clear message
+```
+
 ### T-I005 — Backlinks (FR-004)
 ```
 GIVEN entry A linked to entry B
@@ -209,6 +226,70 @@ WHEN GET /export is called
 THEN a ZIP file is returned
 AND the ZIP contains 3 .md files in folders named by type
 AND each file contains valid front-matter
+```
+
+### T-I010g — Entry Version History (FR-033)
+```
+GIVEN an entry is created
+THEN entry_versions has version_number=1 with the correct title and metadata
+
+WHEN the entry title is updated
+THEN entry_versions has version_number=2
+AND change_summary references the title change
+
+WHEN the entry metadata is updated (a field value changed)
+THEN a new version is created with the updated field values
+AND the previous version is unchanged
+
+GIVEN an entry with 51 saved versions
+WHEN version 52 is written
+THEN only versions 3–52 are retained (oldest pruned, maximum 50)
+```
+
+### T-I010h — Version Restore (FR-034)
+```
+GIVEN an entry at version 5 with current metadata X
+WHEN restore-version Edge Function is called with version_number=3
+THEN the entry's metadata is replaced with version 3's snapshot
+AND a new version (version 6) is created with change_summary "Restored to version 3"
+AND the entry is queued for re-embedding
+AND entry status and entry_links are unchanged
+```
+
+### T-I010i — RAG Contexts (FR-031)
+```
+GIVEN user A creates a context filtering to type_slugs=['book'] and tags=['psychology']
+AND user A has 5 book entries (3 tagged 'psychology') and 5 note entries
+WHEN search_knowledge_base is called with context_id=<that context>
+THEN only the 3 psychology-tagged book entries are searched
+
+GIVEN user A has a default context
+WHEN search_knowledge_base is called with no context_id
+THEN the default context's filters are applied
+
+GIVEN user A and user B
+WHEN user B calls search with user A's context_id
+THEN HTTP 404 is returned (context not visible to user B)
+```
+
+### T-I010j — Trash, Restore, and Auto-Purge (FR-035, FR-036)
+```
+GIVEN an active entry
+WHEN it is soft-deleted
+THEN it appears in the trash view (status=deleted)
+AND it does NOT appear in normal entry listing or search results
+
+WHEN the entry is restored via the trash Edge Function
+THEN its status returns to 'active' and deleted_at is NULL
+AND it reappears in normal listing and search
+
+WHEN empty_trash is called
+THEN all the user's soft-deleted entries are permanently deleted
+
+GIVEN an entry soft-deleted 31 days ago (TRASH_RETENTION_DAYS=30)
+WHEN purge-trash Edge Function runs
+THEN that entry is permanently deleted
+AND an audit_log row records the purge
 ```
 
 ### T-I010c — User-Defined Entry Type Lifecycle (FR-025)
@@ -438,7 +519,7 @@ THEN HTTP 404 is returned
 AND the entry still exists for user A
 ```
 
-### T-S005 — Cross-User Search Isolation (FR-016, SEC-007)
+### T-S005 — Cross-User Search Isolation and RAG Context Isolation (FR-016, FR-031, SEC-007)
 ```
 GIVEN user A with entries and user B with different entries
 WHEN user B calls POST /search with a query matching user A's entries only

@@ -134,6 +134,57 @@ PATCH /rest/v1/field_definitions?id=eq.<uuid>
 { "is_deprecated": true }
 ```
 
+### RAG contexts
+```
+# List user's contexts
+GET /rest/v1/rag_contexts
+  ?select=id,name,description,is_default,filter,created_at
+  &order=is_default.desc,name.asc
+
+# Create a context
+POST /rest/v1/rag_contexts
+{
+  "name": "Project Alpha + Psychology",
+  "is_default": false,
+  "filter": {
+    "layers": ["knowledge_base", "project_workspace"],
+    "project_ids": ["<project-alpha-uuid>"],
+    "tags": ["psychology"]
+  }
+}
+
+# Update a context
+PATCH /rest/v1/rag_contexts?id=eq.<uuid>
+{ "name": "...", "filter": { ... }, "is_default": true }
+
+# Delete a context
+DELETE /rest/v1/rag_contexts?id=eq.<uuid>
+```
+
+### Entry version history
+```
+# List versions for an entry (most recent first)
+GET /rest/v1/entry_versions
+  ?entry_id=eq.<uuid>
+  &select=id,version_number,title,metadata,tags,change_summary,saved_by,created_at
+  &order=version_number.desc
+
+# Get a specific version
+GET /rest/v1/entry_versions?entry_id=eq.<uuid>&version_number=eq.<n>
+  &select=*
+```
+> Version restore is handled by the `restore-version` Edge Function (see §2).
+
+### Trash (soft-deleted entries)
+```
+# List soft-deleted entries
+GET /rest/v1/entries
+  ?status=eq.deleted
+  &select=id,type_slug,title,tags,deleted_at,updated_at
+  &order=deleted_at.desc
+```
+> Restore and hard-delete from trash are handled by Edge Functions (see §2).
+
 ### User profile
 ```
 GET  /rest/v1/profiles?id=eq.<user_id>&select=id,display_name,avatar_url,created_at
@@ -255,25 +306,38 @@ Permanently deletes an entry and all associated data. Requires Supabase JWT or P
 ---
 
 ### `POST /functions/v1/export`
-Exports all non-deleted entries as a ZIP of Markdown files. Returns a binary ZIP stream.
+Exports non-deleted entries as a ZIP of Markdown files. Scope is configurable.
 
-**Request:** Empty body (user identity from auth header).
+**Request:**
+```json
+{
+  "scope": {
+    "layers": ["knowledge_base"],
+    "type_slugs": ["note", "book"],
+    "project_id": "uuid | null",
+    "rag_context_id": "uuid | null",
+    "entry_ids": ["uuid", "..."]
+  }
+}
+```
+All scope fields are optional; omit all for a full export. `rag_context_id` applies the named context's filters exactly. Scope fields are ANDed together.
 
 **Response 200:** `Content-Type: application/zip`
 
 ZIP structure:
 ```
 stratinote-export/
-  note/
-    my-first-note.md
-  book/
-    thinking-fast-and-slow.md
-  meeting/
-    project-alpha/
-      kickoff-2026-01-15.md
+  <type_slug>/
+    <entry-title-slug>.md
+  projects/
+    <project-title-slug>/
+      project.md
+      <linked-entry-slug>.md
 ```
 
-Each `.md` file contains the full entry with YAML front-matter (including `related_entries` populated from `entry_links`).
+Each `.md` file contains YAML front-matter with all field values and resolved `related_entries` titles, plus Markdown field values as document body sections.
+
+**Errors:** `NOT_FOUND` if `project_id` or `rag_context_id` doesn't belong to the user; `422` if scope matches zero entries.
 
 ---
 
@@ -307,8 +371,9 @@ The Stratinote MCP server. Implements the MCP protocol and is registered as the 
 | `create_entry` | `type_slug`, `title`, `field_values: {key: value}`, `tags?` | validate → PostgREST insert |
 | `update_entry` | `entry_id`, `field_values: {key: value}`, `title?` | validate → PostgREST patch |
 | `get_entry` | `entry_id?`, `title?` | PostgREST lookup; title uses full-text search |
-| `list_projects` | (none) | PostgREST: `type_slug=eq.project&status=eq.active` |
-| `search_knowledge_base` | `query`, `limit?`, `type_slug?`, `project_id?` | `search` Edge Function |
+| `list_projects` | (none) | PostgREST: `type_slug=eq.project&status=eq.active` with `default_rag_context_id` |
+| `list_rag_contexts` | (none) | PostgREST: user's `rag_contexts` |
+| `search_knowledge_base` | `query`, `limit?`, `context_id?`, `type_slug?`, `project_id?` | `search` Edge Function with context filter |
 
 **`get_type_schema` response** (what Claude uses to guide the conversation):
 ```json
@@ -347,11 +412,12 @@ The Stratinote MCP server. Implements the MCP protocol and is registered as the 
 {
   "query": "string",
   "limit": 5,
+  "context_id": "uuid | null",
   "type_slug": "note | null",
   "project_id": "uuid | null"
 }
 ```
-Returns full field values so Claude has complete context.
+If `context_id` is provided, the search applies the context's filter configuration before running the vector search. If omitted, the user's default context is applied (or all entries searched if no default exists). Returns full field values so Claude has complete structured context.
 
 ---
 
@@ -394,6 +460,55 @@ Superadmin operations. **Requires Supabase JWT from a superadmin user.** Not cal
 ```
 
 All superadmin actions are written to `audit_log`. Non-superadmin callers receive HTTP 403.
+
+---
+
+### `POST /functions/v1/restore-version`
+Restores an entry to a saved version snapshot. Requires Supabase JWT or PAT.
+
+**Request:**
+```json
+{ "entry_id": "uuid", "version_number": 12 }
+```
+
+**Response 200:**
+```json
+{ "restored_to_version": 12, "new_version_number": 34 }
+```
+
+The restore applies `title`, `metadata`, and `tags` from the specified version snapshot to the current entry, then creates a new version recording the restore (with `change_summary: "Restored to version 12"`). Entry `status` and `entry_links` are unchanged. The entry is queued for re-embedding.
+
+**Errors:** `NOT_FOUND` if entry or version doesn't exist; `FORBIDDEN` if not owned by the user.
+
+---
+
+### `POST /functions/v1/trash`
+Manage soft-deleted entries (restore, hard-delete individual, empty trash). Requires Supabase JWT or PAT.
+
+**Restore a single entry:**
+```json
+{ "action": "restore", "entry_id": "uuid" }
+```
+Response: `{ "restored": true, "status": "active" }`
+
+**Hard-delete a single entry from trash:**
+```json
+{ "action": "hard_delete", "entry_id": "uuid" }
+```
+Response: `{ "deleted": true }`
+
+**Empty trash (all soft-deleted entries):**
+```json
+{ "action": "empty_trash" }
+```
+Response: `{ "deleted_count": 14 }`
+
+All hard-delete actions write to `audit_log`.
+
+---
+
+### `POST /functions/v1/purge-trash` *(internal, cron-triggered)*
+Not user-callable. Runs daily via `pg_cron`. Permanently deletes entries where `deleted_at < now() - interval 'TRASH_RETENTION_DAYS days'`. Writes aggregate to `audit_log`.
 
 ---
 
@@ -442,6 +557,8 @@ Edge Functions enforce rate limiting via an in-memory sliding window per `user_i
 | `export` | 5 requests/hour |
 | `import` | 10 requests/hour |
 | `manage-tokens` | 20 requests/hour |
+| `restore-version` | 30 requests/hour |
+| `trash` | 30 requests/hour |
 | `mcp-server` | 120 requests/minute |
 | All others | 120 requests/minute |
 
