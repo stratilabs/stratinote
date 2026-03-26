@@ -185,6 +185,23 @@ GET /rest/v1/entries
 ```
 > Restore and hard-delete from trash are handled by Edge Functions (see §2).
 
+### Space shares
+```
+# List shares I have granted (outgoing)
+GET /rest/v1/space_shares?grantor_id=eq.<user_id>
+  &select=id,grantee_id,share_type,space_key,created_at,
+          profiles!grantee_id(display_name,avatar_url)
+
+# List shares granted to me (incoming)
+GET /rest/v1/space_shares?grantee_id=eq.<user_id>
+  &select=id,grantor_id,share_type,space_key,created_at,
+          profiles!grantor_id(display_name,avatar_url)
+
+# Revoke a share (grantor only; enforced by RLS)
+DELETE /rest/v1/space_shares?id=eq.<uuid>
+```
+> Creating a share requires the `manage-shares` Edge Function (§2) to validate ownership and resolve the grantee's email to a user ID.
+
 ### User profile
 ```
 GET  /rest/v1/profiles?id=eq.<user_id>&select=id,display_name,avatar_url,created_at
@@ -217,9 +234,11 @@ Full-text and semantic search.
     "tags": ["string"],
     "project_id": "uuid | null"
   },
-  "limit": 5
+  "limit": 5,
+  "include_shared": false
 }
 ```
+`include_shared` (default `false`): when `true`, entries from spaces explicitly shared with the requesting user are included in results.
 
 **Response 200:**
 ```json
@@ -232,7 +251,9 @@ Full-text and semantic search.
       "excerpt": "string (150 char snippet)",
       "score": 0.92,
       "tags": ["string"],
-      "updated_at": "ISO8601"
+      "updated_at": "ISO8601",
+      "ownership": "owned | shared",
+      "shared_by": "Alice (display name) | null"
     }
   ]
 }
@@ -240,9 +261,9 @@ Full-text and semantic search.
 
 **Implementation notes:**
 - `fulltext`: calls PostgreSQL `to_tsvector` + `ts_rank` via RPC.
-- `semantic`: embeds the query via the configured embedding provider, then calls the `match_entries` DB function.
+- `semantic`: embeds the query via the configured embedding provider, then calls the `match_entries` DB function with `p_include_shared`.
 - `hybrid`: runs both, merges and re-ranks results by combined score.
-- All modes enforce user scoping internally.
+- All modes enforce user scoping internally. `include_shared=true` only surfaces entries covered by an active `space_shares` grant; it cannot be used to access arbitrary entries.
 
 ---
 
@@ -371,9 +392,10 @@ The Stratinote MCP server. Implements the MCP protocol and is registered as the 
 | `create_entry` | `type_slug`, `title`, `field_values: {key: value}`, `tags?` | validate → PostgREST insert |
 | `update_entry` | `entry_id`, `field_values: {key: value}`, `title?` | validate → PostgREST patch |
 | `get_entry` | `entry_id?`, `title?` | PostgREST lookup; title uses full-text search |
-| `list_projects` | (none) | PostgREST: `type_slug=eq.project&status=eq.active` with `default_rag_context_id` |
+| `list_projects` | `include_shared?: boolean` | PostgREST: `type_slug=eq.project&status=eq.active`; when `include_shared=true`, also returns shared projects with `shared_by` field |
 | `list_rag_contexts` | (none) | PostgREST: user's `rag_contexts` |
-| `search_knowledge_base` | `query`, `limit?`, `context_id?`, `type_slug?`, `project_id?` | `search` Edge Function with context filter |
+| `list_shared_spaces` | (none) | PostgREST: user's incoming `space_shares` with grantor display names |
+| `search_knowledge_base` | `query`, `limit?`, `context_id?`, `type_slug?`, `project_id?`, `include_shared?` | `search` Edge Function with context filter and optional shared scope |
 
 **`get_type_schema` response** (what Claude uses to guide the conversation):
 ```json
@@ -414,10 +436,59 @@ The Stratinote MCP server. Implements the MCP protocol and is registered as the 
   "limit": 5,
   "context_id": "uuid | null",
   "type_slug": "note | null",
-  "project_id": "uuid | null"
+  "project_id": "uuid | null",
+  "include_shared": false
 }
 ```
-If `context_id` is provided, the search applies the context's filter configuration before running the vector search. If omitted, the user's default context is applied (or all entries searched if no default exists). Returns full field values so Claude has complete structured context.
+If `context_id` is provided, the search applies the context's filter configuration (including `include_shared` from the context's filter, overridden by an explicit `include_shared` parameter). If omitted, the user's default context is applied (or owned entries only if no default exists). Returns full field values so Claude has complete structured context. Shared entry results include a `shared_by` field with the grantor's display name.
+
+---
+
+### `POST /functions/v1/manage-shares`
+Create or revoke space shares. **Requires Supabase JWT** (share management is not callable via PAT for security).
+
+**Create a share:**
+```json
+{
+  "action": "create_share",
+  "grantee_email": "alice@example.com",
+  "share_type": "layer",
+  "space_key": "knowledge_base"
+}
+```
+```json
+{
+  "action": "create_share",
+  "grantee_email": "alice@example.com",
+  "share_type": "project",
+  "space_key": "<project-entry-uuid>"
+}
+```
+**Response 201:**
+```json
+{
+  "id": "uuid",
+  "grantee_id": "uuid",
+  "grantee_display_name": "Alice",
+  "share_type": "layer",
+  "space_key": "knowledge_base",
+  "created_at": "ISO8601"
+}
+```
+
+**Revoke a share:**
+```json
+{ "action": "revoke_share", "share_id": "uuid" }
+```
+**Response 200:** `{ "revoked": true }`
+
+**Errors:**
+- `404` — grantee email not registered in the system.
+- `403` — attempting to share a space the caller does not own, or attempting to re-share a received grant.
+- `409` — share already exists (duplicate).
+- `422` — invalid `share_type` or `space_key`.
+
+Share creation and revocation are written to `audit_log`.
 
 ---
 
@@ -557,6 +628,7 @@ Edge Functions enforce rate limiting via an in-memory sliding window per `user_i
 | `export` | 5 requests/hour |
 | `import` | 10 requests/hour |
 | `manage-tokens` | 20 requests/hour |
+| `manage-shares` | 20 requests/hour |
 | `restore-version` | 30 requests/hour |
 | `trash` | 30 requests/hour |
 | `mcp-server` | 120 requests/minute |

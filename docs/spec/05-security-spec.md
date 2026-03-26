@@ -5,11 +5,12 @@
 ## 1. Threat Model
 
 ### Assets to Protect
-1. **User knowledge entries** — private intellectual content, potentially sensitive.
+1. **User knowledge entries** — private intellectual content, potentially sensitive. Sharing is explicit and consent-based; no entry is accessible to another user without the owner's explicit share grant.
 2. **User credentials** — passwords, session tokens, refresh tokens.
 3. **Personal API Tokens** — grant full user-scoped access; treated as secrets.
 4. **Service API keys** — Anthropic API key, embedding provider key, Supabase service role key.
 5. **User profile data** — display name, email.
+6. **Share grants** — control which spaces are readable by whom; must not be creatable or revocable by anyone other than the grantor.
 
 ### Threat Actors
 | Actor | Description |
@@ -84,25 +85,53 @@ Superadmin status is stored in `profiles.is_superadmin`. This flag:
 The JWT for a superadmin session is indistinguishable from a regular user JWT; the superadmin check is always a database read, never a claim in the token.
 
 ### SEC-007a — RLS on All User Tables
-RLS is **enabled** on `entries`, `entry_links`, `entry_embeddings`, `entry_type_definitions`, `field_definitions`, `api_tokens`, `profiles`, `invites`, and `audit_log`. Every policy references `auth.uid()`.
+RLS is **enabled** on `entries`, `entry_links`, `entry_embeddings`, `entry_type_definitions`, `field_definitions`, `api_tokens`, `profiles`, `invites`, `audit_log`, `rag_contexts`, `entry_versions`, and `space_shares`. Every policy references `auth.uid()`.
 
 **`entries` RLS policies:**
 ```sql
--- SELECT: user can only see their own non-deleted entries
+-- SELECT: user sees their own non-deleted entries, plus entries in shared spaces
 CREATE POLICY "entries_select" ON entries
-  FOR SELECT USING (user_id = auth.uid() AND deleted_at IS NULL);
+  FOR SELECT USING (
+    deleted_at IS NULL AND (
+      user_id = auth.uid()
+      OR EXISTS (
+        SELECT 1 FROM space_shares
+        WHERE grantee_id = auth.uid()
+          AND grantor_id = entries.user_id
+          AND (
+            (share_type = 'layer'   AND space_key = entries.layer)
+            OR (share_type = 'project' AND space_key::uuid = entries.project_id)
+          )
+      )
+    )
+  );
 
 -- INSERT: user can only insert entries for themselves
 CREATE POLICY "entries_insert" ON entries
   FOR INSERT WITH CHECK (user_id = auth.uid());
 
--- UPDATE: user can only update their own entries
+-- UPDATE: user can only update their own entries (shared entries are read-only)
 CREATE POLICY "entries_update" ON entries
   FOR UPDATE USING (user_id = auth.uid());
 
 -- DELETE: user can only delete their own entries
 CREATE POLICY "entries_delete" ON entries
   FOR DELETE USING (user_id = auth.uid());
+```
+
+**`space_shares` RLS policies:**
+```sql
+-- SELECT: both parties can see the share
+CREATE POLICY "shares_select" ON space_shares
+  FOR SELECT USING (grantor_id = auth.uid() OR grantee_id = auth.uid());
+
+-- INSERT: only the grantor can create shares (re-share validation done in Edge Function)
+CREATE POLICY "shares_insert" ON space_shares
+  FOR INSERT WITH CHECK (grantor_id = auth.uid());
+
+-- DELETE: only the grantor can revoke shares
+CREATE POLICY "shares_delete" ON space_shares
+  FOR DELETE USING (grantor_id = auth.uid());
 ```
 
 **`entry_links` RLS policies:**
@@ -222,6 +251,8 @@ The following operations are recorded in an `audit_log` table (service role only
 | Knowledge base exported | user_id (hashed), entry count, timestamp |
 | Knowledge base imported | user_id (hashed), file count, timestamp |
 | Failed PAT authentication | token_prefix (if recognisable), IP (hashed), timestamp |
+| Space share created | grantor_id (hashed), grantee_id (hashed), share_type, space_key, timestamp |
+| Space share revoked | grantor_id (hashed), share_id, share_type, space_key, timestamp |
 
 No entry content or PII is written to the audit log.
 

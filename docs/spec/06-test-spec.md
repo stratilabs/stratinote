@@ -337,6 +337,37 @@ WHEN the superadmin revokes it
 THEN the token is immediately invalid for registration
 ```
 
+### T-I010k — Space Sharing Lifecycle (FR-037, FR-038)
+```
+GIVEN user A and user B are registered
+WHEN user A calls manage-shares with action=create_share, grantee_email=B@email, share_type='layer', space_key='knowledge_base'
+THEN a space_shares row is created
+AND user B can GET /entries filtered to user A's knowledge_base layer entries (read-only)
+AND user A's entries appear in user B's "Shared with Me" sidebar section
+
+WHEN user B attempts to PATCH one of user A's shared entries
+THEN HTTP 403 is returned and the entry is unchanged
+
+WHEN user B calls search with include_shared=true
+THEN user A's shared knowledge_base entries appear in results with ownership='shared' and shared_by='User A'
+
+WHEN user B calls search with include_shared=false (default)
+THEN none of user A's entries appear in results
+
+WHEN user A revokes the share via DELETE /rest/v1/space_shares?id=<uuid>
+THEN user B can no longer access user A's entries
+
+GIVEN a project-level share (share_type='project', space_key=<project_uuid>)
+WHEN user B calls GET /entries?project_id=eq.<project_uuid>
+THEN only entries in that specific project are returned (not user A's other entries)
+
+GIVEN user B attempts to call manage-shares to re-share user A's space with user C
+THEN HTTP 403 is returned (re-sharing not permitted)
+
+GIVEN user A calls manage-shares with grantee_email='nonexistent@example.com'
+THEN HTTP 404 is returned
+```
+
 ### T-I010f — Superadmin User Management (FR-027)
 ```
 GIVEN a superadmin authenticated user
@@ -496,34 +527,41 @@ WHEN any /api/v1/* endpoint is called
 THEN HTTP 401 is returned
 ```
 
-### T-S002 — Cross-User Entry Access (FR-016, SEC-007)
+### T-S002 — Cross-User Entry Access Without Share (FR-016, SEC-007)
 ```
-GIVEN user A with entry A1 and user B with a valid JWT
+GIVEN user A with entry A1 and user B with a valid JWT and NO active share from A
 WHEN user B calls GET /entries/A1.id
 THEN HTTP 404 is returned (not 403, to avoid confirming existence)
 ```
 
-### T-S003 — Cross-User Entry Update (FR-016, SEC-007)
+### T-S003 — Cross-User Entry Update Blocked (FR-016, SEC-007, FR-037)
 ```
 GIVEN user A with entry A1 and user B with a valid JWT
+(regardless of whether a share grant exists — write is always blocked)
 WHEN user B calls PATCH /entries/A1.id
-THEN HTTP 404 is returned
+THEN HTTP 404 or HTTP 403 is returned
 AND the database row is unchanged
 ```
 
-### T-S004 — Cross-User Entry Delete (FR-016, SEC-007)
+### T-S004 — Cross-User Entry Delete Blocked (FR-016, SEC-007, FR-037)
 ```
 GIVEN user A with entry A1 and user B with a valid JWT
+(regardless of whether a share grant exists — delete is always blocked)
 WHEN user B calls DELETE /entries/A1.id
-THEN HTTP 404 is returned
+THEN HTTP 404 or HTTP 403 is returned
 AND the entry still exists for user A
 ```
 
-### T-S005 — Cross-User Search Isolation and RAG Context Isolation (FR-016, FR-031, SEC-007)
+### T-S005 — Cross-User Search Isolation and RAG Context Isolation (FR-016, FR-031, FR-037, SEC-007)
 ```
-GIVEN user A with entries and user B with different entries
-WHEN user B calls POST /search with a query matching user A's entries only
-THEN no results are returned for user B
+GIVEN user A with entries and user B with different entries and NO share grant from A to B
+WHEN user B calls POST /search with include_shared=false (or omitted)
+THEN no results from user A's entries are returned
+
+GIVEN user A's knowledge_base is shared with user B (share_type='layer')
+WHEN user B calls POST /search with include_shared=true
+THEN user A's entries appear with ownership='shared'
+AND user C's entries (no share) do NOT appear even with include_shared=true
 ```
 
 ### T-S006 — Cross-User Link Creation (SEC-007)
@@ -532,6 +570,25 @@ GIVEN user A's entry A1 and user B's entry B1
 WHEN user B calls POST /entries/B1.id/links with target A1.id
 THEN HTTP 404 or 422 is returned
 AND no link is created
+```
+
+### T-S013 — Share Boundary Enforcement (FR-037, SEC-007a)
+```
+GIVEN user A shares only their project_workspace layer with user B
+
+WHEN user B calls GET /entries (include_shared=true)
+THEN only user A's project_workspace entries are returned (not knowledge_base entries)
+
+WHEN user B calls match_entries with p_include_shared=true
+THEN only embeddings for user A's project_workspace entries are searched
+
+GIVEN user A hard-deletes a project they shared with user B
+WHEN user B subsequently calls GET /entries with that project's space_key
+THEN no entries are returned (share is cleaned up on hard delete)
+
+GIVEN user B has a received share from user A
+WHEN user B attempts to INSERT into space_shares with grantor_id=A and grantee_id=C
+THEN HTTP 403 is returned (RLS blocks; re-share validation in Edge Function)
 ```
 
 ### T-S007 — SQL Injection via Query Params (SEC-011)

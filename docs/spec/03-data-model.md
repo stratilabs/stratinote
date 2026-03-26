@@ -8,6 +8,8 @@
 profiles (1) ──── (N) entries
 profiles (1) ──── (N) entry_type_definitions   [user-owned types]
 profiles (1) ──── (N) rag_contexts
+profiles (1) ──── (N) space_shares             [as grantor]
+profiles (1) ──── (N) space_shares             [as grantee]
 entry_type_definitions (1) ──── (N) field_definitions
 entry_type_definitions (1) ──── (N) entries    [via type_definition_id]
 entries   (N) ──── (N) entries                 [via entry_links]
@@ -147,6 +149,7 @@ The core table. All field values are stored in `metadata` keyed by `field_key`. 
 | `user_id` | `uuid` | NOT NULL, FK → `auth.users.id` | Owner |
 | `type_definition_id` | `uuid` | NOT NULL, FK → `entry_type_definitions.id` | Resolves the schema |
 | `type_slug` | `text` | NOT NULL | Denormalized slug for fast filtering without JOIN |
+| `layer` | `text` | NOT NULL, DEFAULT 'knowledge_base' | Denormalized from `entry_type_definitions.layer`; maintained by `sync_layer` trigger; used for layer-based share checks |
 | `schema_version` | `integer` | NOT NULL | Schema version at write time; for future migration tooling |
 | `title` | `text` | NOT NULL | Always present; used for display, search, wiki-link resolution |
 | `metadata` | `jsonb` | NOT NULL, DEFAULT '{}' | All field values: `{ "field_key": value, ... }` |
@@ -168,7 +171,7 @@ The generated column concatenates `title` and the values of all fields with `fie
 - `(tags)` — GIN index for array containment
 - GIN on `to_tsvector('english', search_text)` — full-text search
 
-**RLS:** Users can only access rows where `user_id = auth.uid()` and `deleted_at IS NULL`.
+**RLS:** Users can SELECT rows where `user_id = auth.uid() AND deleted_at IS NULL` (owned entries), **or** where a `space_shares` grant exists for the requesting user covering the entry's `layer` or `project_id`. INSERT, UPDATE, and DELETE are restricted to owned rows only (`user_id = auth.uid()`). See Security Specification §3 for full policy SQL.
 
 ---
 
@@ -300,6 +303,33 @@ An empty `{}` filter (all null fields) means "search everything" — valid as a 
 
 ---
 
+### `space_shares`
+
+Read-only access grants from one user (grantor) to another (grantee) for a layer or project space.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `id` | `uuid` | PK, DEFAULT gen_random_uuid() | |
+| `grantor_id` | `uuid` | NOT NULL, FK → `auth.users.id` ON DELETE CASCADE | User granting access |
+| `grantee_id` | `uuid` | NOT NULL, FK → `auth.users.id` ON DELETE CASCADE | User receiving access |
+| `share_type` | `text` | NOT NULL | `layer` or `project` |
+| `space_key` | `text` | NOT NULL | Layer name (`knowledge_base` / `project_workspace`) for `share_type='layer'`; project entry UUID for `share_type='project'` |
+| `created_at` | `timestamptz` | NOT NULL, DEFAULT now() | |
+
+**Constraints:**
+- UNIQUE `(grantor_id, grantee_id, share_type, space_key)` — no duplicate shares
+- CHECK `grantor_id <> grantee_id` — cannot share with yourself
+- CHECK `share_type IN ('layer', 'project')`
+- CHECK: when `share_type = 'layer'`, `space_key IN ('knowledge_base', 'project_workspace')`
+- No FK on `space_key` when `share_type='project'` (the project UUID is validated at the application layer); cleaned up by the `hard-delete-entry` function and `purge-trash` cron when the project is permanently deleted.
+
+**RLS:**
+- SELECT: rows where `grantee_id = auth.uid()` OR `grantor_id = auth.uid()` (both parties can see the share).
+- INSERT: `grantor_id = auth.uid()` AND the grantor must own the referenced layer/project (re-sharing of received grants is rejected at the Edge Function level).
+- DELETE: `grantor_id = auth.uid()` only (grantors revoke; grantees use a separate "dismiss" action in the UI that does not delete the row but hides it).
+
+---
+
 ### `entry_versions`
 
 Point-in-time snapshots of entry content. Written on every save that changes `title`, `metadata`, or `tags`. Provides history and restore capability.
@@ -321,7 +351,7 @@ Point-in-time snapshots of entry content. Written on every save that changes `ti
 
 **Retention:** A trigger prunes versions older than the 50 most recent per entry after each insert.
 
-**RLS:** Users can only read versions of their own entries. No user write access (versions are written by the `snapshot_version` trigger only).
+**RLS:** Users can read versions of their **own** entries, and also versions of entries in spaces shared with them (same share-check logic as `entries` SELECT). No user write access (versions are written by the `snapshot_version` trigger only). The **Restore** action is blocked for shared entries at the Edge Function level regardless of RLS read access.
 
 ---
 
@@ -344,18 +374,33 @@ Immutable event log for sensitive operations. Service role only — not user-rea
 
 ## Database Functions
 
-### `match_entries(query_embedding vector, match_count int, p_user_id uuid)`
-`SECURITY DEFINER` for semantic search. Enforces user scoping via join on `entries.user_id`.
+### `match_entries(query_embedding vector, match_count int, p_user_id uuid, p_include_shared boolean)`
+`SECURITY DEFINER` for semantic search. Enforces user scoping and share grants.
 
 ```sql
 CREATE OR REPLACE FUNCTION match_entries(
-  query_embedding vector,
-  match_count     int,
-  p_user_id       uuid
+  query_embedding  vector,
+  match_count      int,
+  p_user_id        uuid,
+  p_include_shared boolean DEFAULT false
 )
-RETURNS TABLE (id uuid, title text, metadata jsonb, type_slug text, score float)
+RETURNS TABLE (
+  id       uuid,
+  title    text,
+  metadata jsonb,
+  type_slug text,
+  layer    text,
+  owner_id uuid,   -- same as p_user_id for owned; grantor_id for shared entries
+  score    float
+)
 LANGUAGE plpgsql SECURITY DEFINER;
 ```
+
+The function searches:
+1. All entries owned by `p_user_id` (always).
+2. When `p_include_shared = true`, all entries in spaces explicitly shared with `p_user_id` via `space_shares`, by joining on `(grantor_id = entries.user_id AND ((share_type='layer' AND space_key=entries.layer) OR (share_type='project' AND space_key::uuid=entries.project_id)))`.
+
+Soft-deleted entries (`deleted_at IS NOT NULL`) are always excluded.
 
 ---
 
@@ -364,9 +409,10 @@ LANGUAGE plpgsql SECURITY DEFINER;
 | Trigger | On | Action |
 |---------|-----|--------|
 | `handle_new_user` | INSERT `auth.users` | Creates `profiles` row |
-| `set_updated_at` | UPDATE `entries`, `profiles`, `entry_type_definitions`, `embedding_queue`, `rag_contexts` | Sets `updated_at = now()` |
+| `set_updated_at` | UPDATE `entries`, `profiles`, `entry_type_definitions`, `embedding_queue`, `rag_contexts` | Sets `updated_at = now()` (note: `space_shares` has no `updated_at`; shares are immutable — revoke and recreate) |
 | `queue_embedding_on_change` | INSERT OR UPDATE `entries` (title or metadata changed) | Upserts `embedding_queue` row with `status='pending'` |
 | `sync_project_id` | INSERT OR UPDATE `entries` | Copies `entry_reference` field value with `entry_reference_type='project'` into denormalized `project_id` |
+| `sync_layer` | INSERT OR UPDATE `entries` | Sets denormalized `layer` from `entry_type_definitions.layer` for the entry's `type_definition_id`; used for layer-based share access checks |
 | `update_search_text` | INSERT OR UPDATE `entries` | Rebuilds `search_text` from title + all text-type field values via type schema lookup |
 | `snapshot_version` | INSERT OR UPDATE `entries` (when `title`, `metadata`, or `tags` changed) | Inserts a row into `entry_versions` with computed `change_summary`; prunes versions beyond 50 for this entry |
 | `enforce_token_limit` | INSERT `api_tokens` | Raises exception if user has ≥ 10 active tokens |

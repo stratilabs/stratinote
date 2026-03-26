@@ -93,8 +93,8 @@ The system shall support Create, Read, Update, and Delete operations for all ent
 
 **Acceptance Criteria:**
 - Create: a new entry is persisted with a unique ID, timestamps, and the requesting user's ID.
-- Read: entries are retrievable by ID; only entries owned by the requesting user are returned.
-- Update: the `updated_at` timestamp is refreshed on every update; entry type and field keys cannot be changed after creation.
+- Read: entries are retrievable by ID. Entries owned by the requesting user are always returned. Entries in spaces shared with the requesting user (see FR-037) are also returned as **read-only**; they are clearly distinguished from owned entries.
+- Update: the `updated_at` timestamp is refreshed on every update; entry type and field keys cannot be changed after creation. Write operations (update, delete, restore) are rejected for shared entries — only the owner can modify them.
 - All field values in `metadata` are validated against the type's field definitions at write time; missing required fields cause a validation error.
 - Delete: soft-delete by default (`status = 'deleted'`, `deleted_at` set); hard-delete available as a separate explicit action.
 - Restore: a soft-deleted entry can be restored to its previous status (`active` or `draft`); `deleted_at` is cleared.
@@ -109,8 +109,8 @@ The system shall support Create, Read, Update, and Delete operations for all ent
 Entries shall support explicit links to other entries via `entry_reference` fields and inline wiki-style links (`[[entry-title]]`) in `markdown` fields.
 
 **Acceptance Criteria:**
-- `entry_reference` field values are validated as existing entry IDs owned by the user.
-- `[[entry-title]]` links in Markdown fields are resolved to entry IDs on save and stored in `entry_links`.
+- `entry_reference` field values are validated as existing entry IDs **owned by the user** (not shared entries), to prevent cross-user data coupling.
+- `[[entry-title]]` links in Markdown fields are resolved to entry IDs **owned by the user** on save and stored in `entry_links`.
 - Broken links are flagged as warnings, not errors.
 - An entry's inbound links (backlinks) are queryable via API.
 - Wiki-style links render as clickable hyperlinks in the web UI editor.
@@ -232,7 +232,7 @@ During any Claude.ai session with the Stratinote integration active, Claude shal
 - `search_knowledge_base` accepts: `query` (string), `limit` (int, default 5, max 20), optional `context_id` (uuid), optional `type_slug` and `project_id` filters.
 - If `context_id` is provided, the search is filtered to only entries matching that context's configuration.
 - If no `context_id` is provided, the user's default RAG context is applied if one exists; otherwise all entries are searched.
-- Only entries belonging to the token's owner are searched (RLS applies regardless of context).
+- By default, only entries belonging to the token's owner are searched (RLS applies regardless of context). If the active RAG context has `include_shared: true`, entries from spaces shared with the user (see FR-037) are also included.
 - Retrieved entries include full field values so Claude has complete structured context.
 - Soft-deleted entries are excluded regardless of context configuration.
 - RAG works in any conversation, not only entry-creation flows.
@@ -325,7 +325,7 @@ The web UI shall provide a unified document editor where the entry type's field 
 - Wiki-style links `[[entry title]]` in markdown fields are rendered as clickable chips with the linked entry's title; unresolved links render as plain text with a warning indicator.
 - Saving re-queues the entry for embedding.
 - Unsaved changes trigger a confirmation prompt before navigation.
-- The editor is read-only for entries belonging to other users (future sharing feature) and for system entry type definitions.
+- The editor is read-only for shared entries (see FR-037/FR-038) and for system entry type definitions. All edit controls are visually disabled and a "Shared by [name]" banner is shown.
 
 ---
 
@@ -372,11 +372,13 @@ The system shall support user authentication via Supabase Auth.
 ### FR-016 — Multi-User Isolation
 **Priority:** P1
 
-All user data (entries, embeddings, projects) shall be strictly isolated between users.
+All user data (entries, embeddings, projects) shall be strictly isolated between users by default.
 
 **Acceptance Criteria:**
 - RLS policies prevent any user from reading, writing, or deleting another user's entries at the database level.
-- No API endpoint returns data belonging to a different user regardless of input parameters.
+- No API endpoint returns data belonging to a different user unless an explicit share grant exists (see FR-037).
+- When a share grant exists, the grantee may **read** entries in the shared space only; all write operations remain blocked.
+- The vector search (`match_entries` DB function) can never return entries outside the requesting user's owned entries + explicitly granted shares, even when `include_shared` is enabled.
 - Confirmed via cross-user test cases (see Test Specification).
 
 ---
@@ -413,9 +415,10 @@ Every time an entry is created or updated, its content embedding shall be (re)ge
 The system shall expose a semantic search endpoint that accepts a natural language query and returns ranked, user-scoped results.
 
 **Acceptance Criteria:**
-- Input: query string, optional filters (type, tags, project_id), top-N (default 5, max 20).
-- Output: list of entries with relevance score, title, type, excerpt.
-- Search is scoped to the authenticated user's entries only.
+- Input: query string, optional filters (type, tags, project_id), top-N (default 5, max 20), optional `include_shared` boolean (default false).
+- Output: list of entries with relevance score, title, type, excerpt, and ownership indicator (owned vs shared + grantor display name).
+- By default, search is scoped to the authenticated user's owned entries. When `include_shared=true`, entries from spaces shared with the user are also searched.
+- The `match_entries` DB function enforces user scoping and share grants at the database level — no cross-user leakage is possible even with `include_shared=true`.
 - Response time under 2 seconds for a corpus of up to 10,000 entries.
 
 ---
@@ -618,8 +621,9 @@ Users shall be able to define, save, and manage named RAG contexts that scope wh
 | `project_ids` | Include entries linked to specific projects |
 | `exclude_project_ids` | Exclude entries from specific projects |
 | `tags` | Include only entries containing all specified tags |
+| `include_shared` | `boolean` (default `false`); when `true`, entries from spaces shared with the user are included in the search in addition to owned entries |
 
-A context with no filters (all null) is equivalent to "search everything" and serves as a global context.
+A context with no filters (all null/false) is equivalent to "search only my own entries" and serves as a global owned-only context.
 
 **Acceptance Criteria:**
 - Users can create, name, update, and delete their own RAG contexts.
@@ -643,7 +647,50 @@ A project entry shall be able to declare a default RAG context. When a user work
 
 ---
 
-## 11. Entry Versioning
+## 11. Space Sharing
+
+### FR-037 — Space Sharing (Read-Only Grant)
+**Priority:** P2
+
+Users shall be able to share a selected **space** — either a knowledge base layer or a specific project — with another registered user, granting read-only access to all entries in that space. The grantor retains full ownership and exclusive write access at all times.
+
+**Share types:**
+
+| Share type | `space_key` | Entries included |
+|-----------|------------|-----------------|
+| `layer` | `knowledge_base` or `project_workspace` | All non-deleted entries the grantor owns in that layer |
+| `project` | Project entry UUID | The project entry itself and all entries with `project_id = <uuid>` |
+
+**Acceptance Criteria:**
+- A user can share a layer or project with another user identified by their **email address**; the system resolves the email to a registered user ID. Sharing with an email that does not belong to a registered user is rejected with a clear error.
+- A user cannot share a space with themselves.
+- A user cannot re-share a space they received as a grantee. Only the original owner can create shares.
+- A grantor can revoke any of their active shares at any time; the grantee loses access immediately with no grace period.
+- Shared entries are **read-only** to the grantee: create, update, delete, version-restore, and hard-delete operations on shared entries are rejected with HTTP 403.
+- `entry_reference` fields and wiki-style `[[...]]` links in the grantee's own entries can only reference entries the grantee **owns** — shared entries cannot be linked from owned entries.
+- Each `(grantor_id, grantee_id, share_type, space_key)` combination must be unique — no duplicate shares.
+- A project-level share becomes inaccessible (but not deleted) if the project entry is soft-deleted; the share is permanently removed when the project entry is hard-deleted.
+- Share creation and revocation are written to the `audit_log`.
+
+---
+
+### FR-038 — Shared Space Access in Web UI
+**Priority:** P2
+
+The web UI shall clearly distinguish shared spaces from owned spaces, enforce read-only access for shared content, and give the user full visibility into their incoming and outgoing shares.
+
+**Acceptance Criteria:**
+- The navigation sidebar has a **"Shared with Me"** section distinct from the user's own spaces. Each entry in this section shows the grantor's display name, the share type (layer or project), and the share scope label.
+- A **"Shared by [display name]"** badge is displayed on every entry that originates from a shared space.
+- The structured document editor opens in **read-only mode** for shared entries. All edit controls (save button, field inputs, delete action) are disabled. A banner reads "Shared by [name] — read only".
+- The version history panel for a shared entry is visible but the **Restore** action is disabled.
+- Shared entries **do not appear** in the user's export output. The export scope applies only to owned entries.
+- The user can **dismiss** a received share from the "Shared with Me" sidebar section. Dismissing hides the share from their view but does not revoke it (the grantor must revoke to permanently remove access).
+- A **"Sharing"** settings page lists all outgoing shares the user has created, with the option to revoke each one.
+
+---
+
+## 12. Entry Versioning
 
 ### FR-033 — Entry Version History
 **Priority:** P2
@@ -678,7 +725,7 @@ Users shall be able to restore an entry to any of its saved versions.
 
 ---
 
-## 12. Trash and Auto-Purge
+## 13. Trash and Auto-Purge
 
 ### FR-035 — Trash View and Restore
 **Priority:** P2
